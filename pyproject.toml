@@ -1,0 +1,19 @@
+[project]
+name = "pipecat-local-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.11.12,<4",
+    "babel>=2.17,<3",
+    "fastapi>=0.115.6,<1",
+    "faster-whisper~=1.2.1",
+    "loguru~=0.7.3",
+    "numpy>=1.26.4,<3",
+    "onnxruntime~=1.24.3",
+    "pipecat-ai[local-smart-turn,websocket,whisper]>=1.5.0,<2",
+    "python-dotenv>=1.0,<2",
+    "scipy>=1.15,<2",
+    "scipy-stubs~=1.18.0",
+    "torch>=2.5.0,<3",
+    "uvicorn>=0.32.0,<1",
+]

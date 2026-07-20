@@ -1,0 +1,183 @@
+.avatar-agent {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  color: #fff;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(37, 99, 235, 0.12), transparent 34%),
+    #0f0f11;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.avatar-agent__stage {
+  position: absolute;
+  inset: 0;
+}
+
+.avatar-agent__status {
+  position: absolute;
+  top: max(20px, env(safe-area-inset-top));
+  left: 50%;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.78);
+  background: rgba(15, 15, 17, 0.58);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(14px);
+  transform: translateX(-50%);
+  font-size: 13px;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.avatar-agent__status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #71717a;
+  box-shadow: 0 0 0 4px rgba(113, 113, 122, 0.12);
+}
+
+.avatar-agent__status--connecting .avatar-agent__status-dot {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.14);
+  animation: avatar-agent-pulse 1.2s ease-in-out infinite;
+}
+
+.avatar-agent__status--connected .avatar-agent__status-dot {
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.14);
+}
+
+.avatar-agent__controls {
+  position: absolute;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  z-index: 30;
+  display: flex;
+  min-height: 60px;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  transform: translateX(-50%);
+}
+
+.avatar-agent__connect-button,
+.avatar-agent__disconnect-button,
+.avatar-agent__mute-button {
+  border: 0;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+  transition: transform 180ms ease, background-color 180ms ease, box-shadow 180ms ease, opacity 180ms ease;
+}
+
+.avatar-agent__connect-button,
+.avatar-agent__disconnect-button {
+  min-height: 52px;
+  padding: 0 28px;
+  border-radius: 999px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.avatar-agent__connect-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: #2563eb;
+  box-shadow: 0 8px 28px rgba(37, 99, 235, 0.36);
+}
+
+.avatar-agent__connect-button:disabled {
+  cursor: wait;
+  opacity: 0.82;
+}
+
+.avatar-agent__disconnect-button {
+  color: #fca5a5;
+  background: rgba(30, 41, 59, 0.92);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.avatar-agent__mute-button {
+  display: flex;
+  width: 60px;
+  height: 60px;
+  flex: 0 0 60px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  background: #1e293b;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.avatar-agent__mute-button--muted {
+  background: #ef4444;
+}
+
+.avatar-agent__mute-button svg {
+  width: 24px;
+  height: 24px;
+}
+
+.avatar-agent__connect-button:hover:not(:disabled),
+.avatar-agent__disconnect-button:hover,
+.avatar-agent__mute-button:hover {
+  transform: translateY(-2px);
+}
+
+.avatar-agent__connect-button:focus-visible,
+.avatar-agent__disconnect-button:focus-visible,
+.avatar-agent__mute-button:focus-visible {
+  outline: 3px solid rgba(147, 197, 253, 0.9);
+  outline-offset: 3px;
+}
+
+.avatar-agent__spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.38);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: avatar-agent-spin 800ms linear infinite;
+}
+
+@keyframes avatar-agent-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes avatar-agent-pulse {
+  50% { opacity: 0.45; }
+}
+
+@media (max-width: 640px) {
+  .avatar-agent__status {
+    top: max(14px, env(safe-area-inset-top));
+  }
+
+  .avatar-agent__controls {
+    bottom: max(16px, env(safe-area-inset-bottom));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar-agent__status-dot,
+  .avatar-agent__spinner {
+    animation: none;
+  }
+
+  .avatar-agent__connect-button,
+  .avatar-agent__disconnect-button,
+  .avatar-agent__mute-button {
+    transition: none;
+  }
+}

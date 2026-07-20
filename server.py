@@ -24,8 +24,9 @@ from pipecat.workers.runner import WorkerRunner
 
 # Custom Imports
 from config import config
-from processor import Wav2ArkitBlendshapeProcessor
 from prompts import load_prompt
+from services import ChatterboxTTSService
+from processor import Wav2ArkitBlendshapeProcessor
 
 SYSTEM_PROMPT = load_prompt(
     "system.md",
@@ -72,14 +73,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
             )
 
-            tts = XTTSService(
-                aiohttp_session=session,
-                base_url=config.xtts_base_url,
-                settings=XTTSService.Settings(
-                    voice=config.xtts_voice,
-                    language=config.agent_language,
+            if config.tts.model.startswith("chatterbox"):
+                tts = ChatterboxTTSService(
+                    aiohttp_session=session,
+                    base_url=config.tts.base_url,
+                    settings=ChatterboxTTSService.Settings(
+                        model=config.tts.model,
+                        voice=config.tts.voice,
+                        language=config.agent_language,
+                    ),
                 )
-            )
+            else:
+                tts = XTTSService(
+                    aiohttp_session=session,
+                    base_url=config.tts.base_url,
+                    settings=XTTSService.Settings(
+                        voice=config.tts.voice,
+                        language=config.agent_language,
+                    ),
+                )
 
             blendshapes = Wav2ArkitBlendshapeProcessor()
 

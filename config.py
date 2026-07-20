@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from babel import Locale, UnknownLocaleError
 from dotenv import load_dotenv
@@ -60,6 +61,36 @@ def _env_value(name: str, default: str) -> str:
     return value
 
 
+TTSModel = Literal[
+    "xtts",
+    "chatterbox",
+    "chatterbox-multilingual",
+    "chatterbox-turbo",
+]
+
+
+def _resolve_tts_model(value: str) -> TTSModel:
+    model = value.strip().casefold()
+    supported_models = {
+        "xtts",
+        "chatterbox",
+        "chatterbox-multilingual",
+        "chatterbox-turbo",
+    }
+    if model not in supported_models:
+        raise ValueError(
+            "TTS_MODEL must be one of: " + ", ".join(sorted(supported_models))
+        )
+    return cast(TTSModel, model)
+
+
+@dataclass(frozen=True)
+class TTSConfig:
+    model: TTSModel
+    base_url: str
+    voice: str
+
+
 @dataclass(frozen=True)
 class AppConfig:
     agent_language: Language
@@ -67,12 +98,19 @@ class AppConfig:
     whisper_model: Model
     ollama_base_url: str
     ollama_model: str
-    xtts_base_url: str
-    xtts_voice: str
+    tts: TTSConfig
 
     @classmethod
     def from_env(cls) -> "AppConfig":
         language = _resolve_language(os.getenv("AGENT_LANGUAGE", "en"))
+        tts_model = _resolve_tts_model(os.getenv("TTS_MODEL", "xtts"))
+        if tts_model == "xtts":
+            default_tts_base_url = "http://localhost:8000"
+            default_tts_voice = "Claribel Dervla"
+        else:
+            default_tts_base_url = "http://localhost:8004"
+            default_tts_voice = "Emily.wav"
+
         return cls(
             agent_language=language,
             agent_language_name=_language_name(language),
@@ -83,8 +121,11 @@ class AppConfig:
                 "OLLAMA_BASE_URL", "http://localhost:11434/v1"
             ),
             ollama_model=_env_value("OLLAMA_MODEL", "gpt-oss:20b"),
-            xtts_base_url=_env_value("XTTS_BASE_URL", "http://localhost:8000"),
-            xtts_voice=_env_value("XTTS_VOICE", "Claribel Dervla"),
+            tts=TTSConfig(
+                model=tts_model,
+                base_url=_env_value("TTS_BASE_URL", default_tts_base_url),
+                voice=_env_value("TTS_VOICE", default_tts_voice),
+            ),
         )
 
 

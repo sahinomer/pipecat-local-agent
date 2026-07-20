@@ -5,7 +5,7 @@ Pipecat Local Agent is a small, independent, local-first voice-agent demo built 
 ## Current capabilities
 
 - Streams microphone input and synthesized speech over a Pipecat WebSocket transport.
-- Uses faster-whisper for local speech-to-text, Ollama for the language model, and an XTTS Streaming Server for text-to-speech.
+- Uses faster-whisper for local speech-to-text, Ollama for the language model, and a selectable XTTS or Chatterbox server for text-to-speech.
 - Uses Pipecat's bundled Silero VAD and Local Smart Turn model for voice activity and end-of-turn handling.
 - Starts the assistant automatically when a browser client connects.
 - Shows user and assistant transcripts in the browser client.
@@ -51,7 +51,9 @@ Required for the backend:
 - Python 3.12 or newer.
 - [uv](https://docs.astral.sh/uv/) for the locked Python environment.
 - A running [Ollama](https://github.com/ollama/ollama) server with the model named by `OLLAMA_MODEL`.
-- A running [XTTS Streaming Server](https://github.com/coqui-ai/xtts-streaming-server) with the voice named by `XTTS_VOICE`.
+- One supported TTS server:
+  - [XTTS Streaming Server](https://github.com/coqui-ai/xtts-streaming-server); or
+  - [Chatterbox TTS Server](https://github.com/devnen/Chatterbox-TTS-Server).
 
 Models and assets:
 
@@ -76,14 +78,17 @@ Create `.env` from the checked-in example and change values to match your local 
 cp .env.example .env
 ```
 
+The example enables XTTS by default and includes a commented Chatterbox configuration. Keep only one TTS configuration block active.
+
 | Variable | Purpose | Example default |
 | --- | --- | --- |
 | `AGENT_LANGUAGE` | BCP-47 language code used by prompts, STT, and TTS | `en` |
 | `WHISPER_MODEL_SIZE` | Pipecat faster-whisper model name | `small` |
 | `OLLAMA_BASE_URL` | Ollama's OpenAI-compatible endpoint | `http://localhost:11434/v1` |
 | `OLLAMA_MODEL` | Model served by Ollama | `gpt-oss:20b` |
-| `XTTS_BASE_URL` | XTTS Streaming Server endpoint | `http://localhost:8000` |
-| `XTTS_VOICE` | Voice exposed by the XTTS server | `Claribel Dervla` |
+| `TTS_MODEL` | TTS model: `xtts`, `chatterbox`, `chatterbox-multilingual`, or `chatterbox-turbo` | `xtts` |
+| `TTS_BASE_URL` | Base URL for the selected TTS model | `http://localhost:8000` |
+| `TTS_VOICE` | Voice name or filename for the selected TTS model | `Claribel Dervla` |
 
 The frontend has a separate optional `VITE_BACKEND_URL`; it is documented in the [frontend guide](frontend/README.md).
 
@@ -104,11 +109,33 @@ ollama serve
 
 If the Ollama desktop app or service is already running, there is no need to start a second server. If you changed `OLLAMA_MODEL`, pull that model instead.
 
-In another terminal, start the XTTS server. Review the [Coqui model license](https://huggingface.co/coqui/XTTS-v2/blob/main/LICENSE.txt) before setting `COQUI_TOS_AGREED=1`:
+In another terminal, start the TTS backend selected by `TTS_MODEL`.
+
+For XTTS, review the [Coqui model license](https://huggingface.co/coqui/XTTS-v2/blob/main/LICENSE.txt) before setting `COQUI_TOS_AGREED=1`:
 
 ```sh
 docker run --gpus=all -e COQUI_TOS_AGREED=1 --rm -p 8000:80 ghcr.io/coqui-ai/xtts-streaming-server:latest-cuda121
 ```
+
+For Chatterbox, follow the server's hardware-specific installation instructions. Its default Docker Compose setup can be started from a separate checkout:
+
+```sh
+git clone https://github.com/devnen/Chatterbox-TTS-Server.git
+cd Chatterbox-TTS-Server
+docker compose up -d --build
+```
+
+Then configure the active TTS model and choose a filename returned by `GET /v1/audio/voices`:
+
+```env
+TTS_MODEL=chatterbox
+TTS_BASE_URL=http://localhost:8004
+TTS_VOICE=Emily.wav
+```
+
+`TTS_MODEL` is also sent as the OpenAI-compatible `model` field. For languages other than English, use `TTS_MODEL=chatterbox-multilingual` and ensure the Chatterbox server has its Multilingual engine active. The current server implementation still controls its active engine server-side.
+
+The Chatterbox OpenAI-compatible route returns a complete encoded audio file. The local adapter decodes its WAV response, resamples it when necessary, and emits raw PCM frames for Pipecat. The route does not provide token-level audio streaming; for short voice-agent utterances, audio begins after Chatterbox finishes synthesizing the utterance.
 
 Then start the backend from the repository root:
 

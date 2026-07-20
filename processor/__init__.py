@@ -1,4 +1,4 @@
-from .blendshape_processor import (
+from .wav2arkit_blendshape import (
     Wav2ArkitBlendshapeModel,
     Wav2ArkitBlendshapeProcessor,
 )

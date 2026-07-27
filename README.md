@@ -5,7 +5,7 @@ Pipecat Local Agent is a small, independent, local-first voice-agent demo built 
 ## Current capabilities
 
 - Streams microphone input and synthesized speech over a Pipecat WebSocket transport.
-- Uses faster-whisper for local speech-to-text, Ollama for the language model, and a selectable XTTS or Chatterbox server for text-to-speech.
+- Uses faster-whisper for local speech-to-text, selectable Ollama or vLLM for the language model, and a selectable XTTS or Chatterbox server for text-to-speech.
 - Uses Pipecat's bundled Silero VAD and Local Smart Turn model for voice activity and end-of-turn handling.
 - Starts the assistant automatically when a browser client connects.
 - Shows user and assistant transcripts in the browser client.
@@ -50,14 +50,15 @@ Required for the backend:
 
 - Python 3.12 or newer.
 - [uv](https://docs.astral.sh/uv/) for the locked Python environment.
-- A running [Ollama](https://github.com/ollama/ollama) server with the model named by `OLLAMA_MODEL`.
+- A running [Ollama](https://github.com/ollama/ollama) or
+  [vLLM](https://docs.vllm.ai/) server with the model named by `LLM_MODEL`.
 - One supported TTS server:
   - [XTTS Streaming Server](https://github.com/coqui-ai/xtts-streaming-server); or
   - [Chatterbox TTS Server](https://github.com/devnen/Chatterbox-TTS-Server).
 
 Models and assets:
 
-- Pull the configured Ollama model explicitly. The default is `gpt-oss:20b`.
+- Make the configured `LLM_MODEL` available to the selected LLM server. The default Ollama model is `gpt-oss:20b`.
 - faster-whisper downloads the configured Whisper model on first use. The default is `small`.
 - wav2arkit downloads two hash-checked ONNX artifacts on first connection and stores them in `.cache/wav2arkit` when the backend is launched from the repository root.
 - Silero VAD and Local Smart Turn model files are bundled with the installed Pipecat package; they need no separate setup.
@@ -84,8 +85,10 @@ The example enables XTTS by default and includes a commented Chatterbox configur
 | --- | --- | --- |
 | `AGENT_LANGUAGE` | BCP-47 language code used by prompts, STT, and TTS | `en` |
 | `WHISPER_MODEL_SIZE` | Pipecat faster-whisper model name | `small` |
-| `OLLAMA_BASE_URL` | Ollama's OpenAI-compatible endpoint | `http://localhost:11434/v1` |
-| `OLLAMA_MODEL` | Model served by Ollama | `gpt-oss:20b` |
+| `LLM_SERVICE` | LLM backend: `ollama` or `vllm` | `ollama` |
+| `LLM_BASE_URL` | Selected backend's OpenAI-compatible endpoint | `http://localhost:11434/v1` |
+| `LLM_MODEL` | Model exposed by the selected backend | `gpt-oss:20b` |
+| `LLM_API_KEY` | vLLM API key, or a placeholder when vLLM auth is disabled | `ollama` |
 | `TTS_MODEL` | TTS model: `xtts`, `chatterbox`, `chatterbox-multilingual`, or `chatterbox-turbo` | `xtts` |
 | `TTS_BASE_URL` | Base URL for the selected TTS model | `http://localhost:8000` |
 | `TTS_VOICE` | Voice name or filename for the selected TTS model | `Claribel Dervla` |
@@ -107,7 +110,21 @@ ollama pull gpt-oss:20b
 ollama serve
 ```
 
-If the Ollama desktop app or service is already running, there is no need to start a second server. If you changed `OLLAMA_MODEL`, pull that model instead.
+If the Ollama desktop app or service is already running, there is no need to start a second server. If you changed `LLM_MODEL`, pull that model instead.
+
+To use an already-running vLLM OpenAI-compatible server instead, configure:
+
+```env
+LLM_SERVICE=vllm
+LLM_BASE_URL=http://localhost:8000/v1
+LLM_MODEL=your-model-name
+LLM_API_KEY=vllm
+```
+
+`LLM_MODEL` must match the model name exposed by vLLM. If the server was
+started with API-key authentication, set the same key in `LLM_API_KEY`;
+otherwise, a non-empty placeholder such as `vllm` is sufficient for the
+OpenAI client.
 
 In another terminal, start the TTS backend selected by `TTS_MODEL`.
 

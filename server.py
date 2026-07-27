@@ -25,7 +25,7 @@ from pipecat.workers.runner import WorkerRunner
 # Custom Imports
 from config import config
 from prompts import load_prompt
-from services import ChatterboxTTSService
+from services import ChatterboxTTSService, VLLMService
 from processor import Wav2ArkitBlendshapeProcessor
 
 SYSTEM_PROMPT = load_prompt(
@@ -65,13 +65,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
             )
 
-            llm = OLLamaLLMService(
-                base_url=config.ollama_base_url,
-                settings=OLLamaLLMService.Settings(
-                    model=config.ollama_model,
-                    system_instruction=SYSTEM_PROMPT,
+            if config.llm.service == "vllm":
+                llm = VLLMService(
+                    base_url=config.llm.base_url,
+                    api_key=config.llm.api_key,
+                    settings=VLLMService.Settings(
+                        model=config.llm.model,
+                        system_instruction=SYSTEM_PROMPT,
+                    ),
                 )
-            )
+            else:
+                llm = OLLamaLLMService(
+                    base_url=config.llm.base_url,
+                    settings=OLLamaLLMService.Settings(
+                        model=config.llm.model,
+                        system_instruction=SYSTEM_PROMPT,
+                    ),
+                )
 
             if config.tts.model.startswith("chatterbox"):
                 tts = ChatterboxTTSService(

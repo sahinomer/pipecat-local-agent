@@ -67,6 +67,14 @@ TTSModel = Literal[
     "chatterbox-multilingual",
     "chatterbox-turbo",
 ]
+LLMService = Literal["ollama", "vllm"]
+
+
+def _resolve_llm_service(value: str) -> LLMService:
+    service = value.strip().casefold()
+    if service not in {"ollama", "vllm"}:
+        raise ValueError("LLM_SERVICE must be one of: ollama, vllm")
+    return cast(LLMService, service)
 
 
 def _resolve_tts_model(value: str) -> TTSModel:
@@ -92,18 +100,46 @@ class TTSConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    service: LLMService
+    base_url: str
+    model: str
+    api_key: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     agent_language: Language
     agent_language_name: str
     whisper_model: Model
-    ollama_base_url: str
-    ollama_model: str
+    llm: LLMConfig
     tts: TTSConfig
 
     @classmethod
     def from_env(cls) -> "AppConfig":
+        legacy_ollama_variables = {
+            "OLLAMA_BASE_URL",
+            "OLLAMA_MODEL",
+        }.intersection(os.environ)
+        if legacy_ollama_variables:
+            variables = ", ".join(sorted(legacy_ollama_variables))
+            raise ValueError(
+                f"{variables} are no longer supported. Configure Ollama with "
+                "LLM_SERVICE=ollama, LLM_BASE_URL, and LLM_MODEL instead."
+            )
+
         language = _resolve_language(os.getenv("AGENT_LANGUAGE", "en"))
+        llm_service = _resolve_llm_service(os.getenv("LLM_SERVICE", "ollama"))
         tts_model = _resolve_tts_model(os.getenv("TTS_MODEL", "xtts"))
+        if llm_service == "ollama":
+            default_llm_base_url = "http://localhost:11434/v1"
+            default_llm_model = "gpt-oss:20b"
+            default_llm_api_key = "ollama"
+        else:
+            default_llm_base_url = "http://localhost:8000/v1"
+            default_llm_model = "default"
+            default_llm_api_key = "vllm"
+
         if tts_model == "xtts":
             default_tts_base_url = "http://localhost:8000"
             default_tts_voice = "Claribel Dervla"
@@ -117,10 +153,12 @@ class AppConfig:
             whisper_model=_resolve_whisper_model(
                 _env_value("WHISPER_MODEL_SIZE", "small")
             ),
-            ollama_base_url=_env_value(
-                "OLLAMA_BASE_URL", "http://localhost:11434/v1"
+            llm=LLMConfig(
+                service=llm_service,
+                base_url=_env_value("LLM_BASE_URL", default_llm_base_url),
+                model=_env_value("LLM_MODEL", default_llm_model),
+                api_key=_env_value("LLM_API_KEY", default_llm_api_key),
             ),
-            ollama_model=_env_value("OLLAMA_MODEL", "gpt-oss:20b"),
             tts=TTSConfig(
                 model=tts_model,
                 base_url=_env_value("TTS_BASE_URL", default_tts_base_url),

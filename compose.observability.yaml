@@ -1,4 +1,15 @@
 services:
+  loki:
+    image: grafana/loki:3.7.3
+    command:
+      - -config.file=/etc/loki/loki.yml
+    ports:
+      - "127.0.0.1:3100:3100"
+    restart: unless-stopped
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+
   prometheus:
     image: prom/prometheus:v3.13.0
     command:
@@ -19,6 +30,7 @@ services:
   grafana:
     image: grafana/grafana:13.1.0
     depends_on:
+      - loki
       - prometheus
     environment:
       GF_SECURITY_ADMIN_USER: admin
@@ -34,4 +46,5 @@ services:
 
 volumes:
   grafana-data:
+  loki-data:
   prometheus-data:

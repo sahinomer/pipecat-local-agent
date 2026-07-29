@@ -156,14 +156,25 @@ class ProcessorNameTests(unittest.TestCase):
 
 
 class MetricsHttpServerTests(unittest.TestCase):
+    def test_rejects_invalid_metrics_url(self):
+        metrics = AgentMetrics(
+            registry=CollectorRegistry(),
+            collect_system=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Metrics URL"):
+            MetricsHttpServer(
+                url="https://127.0.0.1:8001",
+                registry=metrics.registry,
+            )
+
     def test_serves_the_configured_registry(self):
         metrics = AgentMetrics(
             registry=CollectorRegistry(),
             collect_system=False,
         )
         server = MetricsHttpServer(
-            host="127.0.0.1",
-            port=0,
+            url="http://127.0.0.1:0",
             registry=metrics.registry,
         )
 

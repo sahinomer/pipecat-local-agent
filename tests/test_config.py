@@ -37,9 +37,16 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(config.tts.base_url, "http://localhost:8000")
         self.assertEqual(config.tts.voice, "Claribel Dervla")
         self.assertTrue(config.observability.enabled)
-        self.assertEqual(config.observability.metrics_host, "127.0.0.1")
-        self.assertEqual(config.observability.metrics_port, 8001)
+        self.assertEqual(
+            config.observability.metrics_url,
+            "http://127.0.0.1:8001",
+        )
         self.assertTrue(config.observability.gpu_metrics_enabled)
+        self.assertEqual(
+            config.observability.loki_url,
+            "http://127.0.0.1:3100",
+        )
+        self.assertEqual(config.observability.log_level, "INFO")
 
     def test_vllm_and_chatterbox_configuration(self):
         environment = {
@@ -71,18 +78,26 @@ class AppConfigTests(unittest.TestCase):
     def test_observability_configuration(self):
         environment = {
             "OBSERVABILITY_ENABLED": "false",
-            "METRICS_HOST": "0.0.0.0",
-            "METRICS_PORT": "9101",
+            "METRICS_URL": "http://0.0.0.0:9101",
             "GPU_METRICS_ENABLED": "off",
+            "LOKI_URL": "http://loki.example:3100",
+            "LOG_LEVEL": "debug",
         }
 
         with patch.dict(os.environ, environment, clear=True):
             config = AppConfig.from_env()
 
         self.assertFalse(config.observability.enabled)
-        self.assertEqual(config.observability.metrics_host, "0.0.0.0")
-        self.assertEqual(config.observability.metrics_port, 9101)
+        self.assertEqual(
+            config.observability.metrics_url,
+            "http://0.0.0.0:9101",
+        )
         self.assertFalse(config.observability.gpu_metrics_enabled)
+        self.assertEqual(
+            config.observability.loki_url,
+            "http://loki.example:3100",
+        )
+        self.assertEqual(config.observability.log_level, "DEBUG")
 
     def test_invalid_observability_configuration_is_rejected(self):
         with patch.dict(
@@ -95,10 +110,10 @@ class AppConfigTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"METRICS_PORT": "70000"},
+            {"LOG_LEVEL": "verbose"},
             clear=True,
         ):
-            with self.assertRaisesRegex(ValueError, "METRICS_PORT"):
+            with self.assertRaisesRegex(ValueError, "LOG_LEVEL"):
                 AppConfig.from_env()
 
 

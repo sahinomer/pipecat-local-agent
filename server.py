@@ -1,5 +1,7 @@
 import asyncio
+import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 import aiohttp
@@ -28,7 +30,12 @@ from pipecat.workers.runner import WorkerRunner
 
 # Custom Imports
 from config import config
-from observability import METRICS, MetricsHttpServer, PrometheusMetricsObserver
+from observability import (
+    METRICS,
+    LokiLogSink,
+    MetricsHttpServer,
+    PrometheusMetricsObserver,
+)
 from prompts import load_prompt
 from services import ChatterboxTTSService, VLLMService
 from processor import Wav2ArkitBlendshapeProcessor
@@ -46,11 +53,38 @@ INITIAL_PROMPT = load_prompt(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     metrics_server = None
+    loki_sink = None
+    loki_handler_id = None
+
+    logger.remove()
+    logger.configure(extra={"session_id": "system"})
+    logger.add(
+        sys.stderr,
+        level=config.observability.log_level,
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "session=<cyan>{extra[session_id]}</cyan> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        ),
+        colorize=True,
+        diagnose=False,
+    )
+
     if config.observability.enabled:
+        loki_sink = LokiLogSink(base_url=config.observability.loki_url)
+        await loki_sink.start()
+        loki_handler_id = logger.add(
+            loki_sink,
+            level=config.observability.log_level,
+            diagnose=False,
+            catch=True,
+        )
+
         METRICS.set_gpu_enabled(config.observability.gpu_metrics_enabled)
         metrics_server = MetricsHttpServer(
-            host=config.observability.metrics_host,
-            port=config.observability.metrics_port,
+            url=config.observability.metrics_url,
             registry=METRICS.registry,
         )
         metrics_server.start()
@@ -60,6 +94,10 @@ async def lifespan(_app: FastAPI):
     finally:
         if metrics_server is not None:
             metrics_server.stop()
+        if loki_handler_id is not None:
+            logger.remove(loki_handler_id)
+        if loki_sink is not None:
+            await loki_sink.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -67,11 +105,18 @@ app = FastAPI(lifespan=lifespan)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    session_id = uuid.uuid4().hex
+    with logger.contextualize(session_id=session_id):
+        await run_agent_session(websocket, session_id=session_id)
+
+
+async def run_agent_session(websocket: WebSocket, *, session_id: str):
     await websocket.accept()
     connection_started = time.perf_counter()
     connection_outcome = "completed"
     METRICS.connections_active.inc()
     METRICS.connections_total.inc()
+    logger.info("Agent session started")
 
     try:
         # 1. Transport with Custom Serializer
@@ -167,6 +212,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             worker = PipelineWorker(
                 pipeline,
+                app_resources={"session_id": session_id},
+                conversation_id=session_id,
                 params=PipelineParams(
                     enable_metrics=True,
                     enable_usage_metrics=True,
@@ -200,14 +247,18 @@ async def websocket_endpoint(websocket: WebSocket):
         raise
     except Exception as e:
         connection_outcome = "error"
-        logger.error(f"Error in websocket session: {e}")
+        logger.exception("Error in agent session: {}", e)
     finally:
+        connection_duration = time.perf_counter() - connection_started
         METRICS.connections_active.dec()
         METRICS.connection_terminations_total.labels(
             outcome=connection_outcome
         ).inc()
-        METRICS.connection_duration_seconds.observe(
-            time.perf_counter() - connection_started
+        METRICS.connection_duration_seconds.observe(connection_duration)
+        logger.info(
+            "Agent session finished",
+            outcome=connection_outcome,
+            duration_seconds=round(connection_duration, 3),
         )
 
 

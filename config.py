@@ -76,17 +76,23 @@ def _env_bool(name: str, default: bool) -> bool:
     )
 
 
-def _env_port(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        port = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-    if not 1 <= port <= 65535:
-        raise ValueError(f"{name} must be between 1 and 65535")
-    return port
+def _env_log_level(name: str, default: str) -> str:
+    level = _env_value(name, default).upper()
+    supported_levels = {
+        "TRACE",
+        "DEBUG",
+        "INFO",
+        "SUCCESS",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+    }
+    if level not in supported_levels:
+        raise ValueError(
+            f"{name} must be one of: "
+            + ", ".join(sorted(supported_levels))
+        )
+    return level
 
 
 TTSModel = Literal[
@@ -138,9 +144,10 @@ class LLMConfig:
 @dataclass(frozen=True)
 class ObservabilityConfig:
     enabled: bool
-    metrics_host: str
-    metrics_port: int
+    metrics_url: str
     gpu_metrics_enabled: bool
+    loki_url: str
+    log_level: str
 
 
 @dataclass(frozen=True)
@@ -203,9 +210,13 @@ class AppConfig:
             ),
             observability=ObservabilityConfig(
                 enabled=_env_bool("OBSERVABILITY_ENABLED", True),
-                metrics_host=_env_value("METRICS_HOST", "127.0.0.1"),
-                metrics_port=_env_port("METRICS_PORT", 8001),
+                metrics_url=_env_value(
+                    "METRICS_URL",
+                    "http://127.0.0.1:8001",
+                ),
                 gpu_metrics_enabled=_env_bool("GPU_METRICS_ENABLED", True),
+                loki_url=_env_value("LOKI_URL", "http://127.0.0.1:3100"),
+                log_level=_env_log_level("LOG_LEVEL", "INFO"),
             ),
         )
 

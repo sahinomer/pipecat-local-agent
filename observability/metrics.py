@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import threading
 from typing import Any
+from urllib.parse import urlsplit
 
 import psutil
 from loguru import logger
@@ -331,6 +332,22 @@ class AgentMetrics:
             labelnames=["processor"],
             registry=self.registry,
         )
+        self.log_records_sent_total = Counter(
+            "local_agent_log_records_sent",
+            "Log records accepted by Loki.",
+            registry=self.registry,
+        )
+        self.log_records_dropped_total = Counter(
+            "local_agent_log_records_dropped",
+            "Log records dropped before Loki accepted them.",
+            labelnames=["reason"],
+            registry=self.registry,
+        )
+        self.loki_available = Gauge(
+            "local_agent_loki_available",
+            "Whether the most recent Loki delivery attempt succeeded.",
+            registry=self.registry,
+        )
 
         self._system_collector = None
         if collect_system:
@@ -361,11 +378,29 @@ class MetricsHttpServer:
     def __init__(
         self,
         *,
-        host: str,
-        port: int,
+        url: str,
         registry: CollectorRegistry,
     ):
-        self._host = host
+        parsed = urlsplit(url)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("Metrics URL contains an invalid port") from exc
+        if (
+            parsed.scheme != "http"
+            or not parsed.hostname
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "Metrics URL must be an HTTP URL with an explicit host and port"
+            )
+
+        self._host = parsed.hostname
         self._port = port
         self._registry = registry
         self._server = None

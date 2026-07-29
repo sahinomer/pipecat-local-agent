@@ -92,6 +92,10 @@ The example enables XTTS by default and includes a commented Chatterbox configur
 | `TTS_MODEL` | TTS model: `xtts`, `chatterbox`, `chatterbox-multilingual`, or `chatterbox-turbo` | `xtts` |
 | `TTS_BASE_URL` | Base URL for the selected TTS model | `http://localhost:8000` |
 | `TTS_VOICE` | Voice name or filename for the selected TTS model | `Claribel Dervla` |
+| `OBSERVABILITY_ENABLED` | Enable the Prometheus exporter and Pipecat metrics observer | `true` |
+| `METRICS_HOST` | Address for the metrics-only HTTP server | `127.0.0.1` |
+| `METRICS_PORT` | Port for the Prometheus `/metrics` endpoint | `8001` |
+| `GPU_METRICS_ENABLED` | Collect whole-GPU metrics through NVIDIA NVML when available | `true` |
 
 The frontend has a separate optional `VITE_BACKEND_URL`; it is documented in the [frontend guide](frontend/README.md).
 
@@ -161,6 +165,95 @@ uv run python server.py
 ```
 
 For browser-client installation and startup, follow [`frontend/README.md`](frontend/README.md).
+
+## Local observability
+
+The agent exposes Prometheus metrics from a separate metrics-only HTTP server.
+The application server remains bound to `127.0.0.1:7860`, while metrics use
+the address and port configured by `METRICS_HOST` and `METRICS_PORT`.
+
+The exporter includes:
+
+- Active and total connections, duration, and termination outcomes.
+- Whole-host CPU and RAM, agent-process CPU and RAM, and thread count.
+- Whole-GPU utilization, memory, temperature, and power through NVIDIA NVML.
+  GPU panels remain empty on systems without a supported NVIDIA driver.
+- Pipecat processing, TTFB, TTFA, text aggregation, token, TTS usage, turn,
+  and error metrics.
+- Any processor that opts into Pipecat processing metrics, including
+  `Wav2ArkitBlendshapeProcessor`, appears automatically under its processor
+  name. Custom processors do not depend on the observability implementation.
+
+System CPU/RAM metrics describe the machine and the Pipecat process. GPU
+metrics describe each complete GPU. They do not attribute usage to individual
+Ollama, vLLM, or TTS processes.
+
+### Start Prometheus and Grafana
+
+Prometheus in Docker Desktop reaches the host through
+`host.docker.internal`. The metrics server must therefore listen beyond the
+loopback interface. Set this in the local `.env` while using the containerized
+dashboard:
+
+```env
+OBSERVABILITY_ENABLED=true
+METRICS_HOST=0.0.0.0
+METRICS_PORT=8001
+GPU_METRICS_ENABLED=true
+```
+
+This exposes read-only system and agent metrics on the local network interface.
+Do not publish port `8001` through a router or expose it to an untrusted
+network. Keep `METRICS_HOST=127.0.0.1` when Prometheus runs directly on the
+host or observability is not in use.
+
+Start the backend, then verify the metrics endpoint:
+
+```powershell
+uv run python server.py
+Invoke-WebRequest http://127.0.0.1:8001/metrics
+```
+
+Start the provisioned observability stack in another terminal:
+
+```sh
+docker compose -f compose.observability.yaml up -d
+```
+
+Open Grafana at `http://localhost:3000`, sign in with `admin` / `admin`, then
+open **Dashboards → Pipecat Local Agent → Local Agent Performance**. Prometheus
+is available at `http://localhost:9090`. Both services bind their published
+ports to host loopback, and their data is retained in named Docker volumes.
+
+Stop the stack without removing its stored data:
+
+```sh
+docker compose -f compose.observability.yaml down
+```
+
+### Optional native vLLM metrics
+
+The dashboard always derives token throughput from Pipecat usage metrics.
+When vLLM is selected, its native Prometheus endpoint provides more precise
+generation throughput and time-per-output-token measurements.
+
+Edit `observability/prometheus/targets/vllm.json` to point to the vLLM API
+server:
+
+```json
+[
+  {
+    "targets": ["host.docker.internal:8000"],
+    "labels": {
+      "source": "vllm"
+    }
+  }
+]
+```
+
+Use the actual vLLM port when it differs from `8000`. Prometheus reloads this
+file automatically. Leave the file as `[]` for Ollama or when native vLLM
+metrics are not required.
 
 
 ## License

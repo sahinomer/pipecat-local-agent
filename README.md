@@ -92,10 +92,11 @@ The example enables XTTS by default and includes a commented Chatterbox configur
 | `TTS_MODEL` | TTS model: `xtts`, `chatterbox`, `chatterbox-multilingual`, or `chatterbox-turbo` | `xtts` |
 | `TTS_BASE_URL` | Base URL for the selected TTS model | `http://localhost:8000` |
 | `TTS_VOICE` | Voice name or filename for the selected TTS model | `Claribel Dervla` |
-| `OBSERVABILITY_ENABLED` | Enable the Prometheus exporter and Pipecat metrics observer | `true` |
-| `METRICS_HOST` | Address for the metrics-only HTTP server | `127.0.0.1` |
-| `METRICS_PORT` | Port for the Prometheus `/metrics` endpoint | `8001` |
+| `OBSERVABILITY_ENABLED` | Enable Prometheus metrics and direct Loki log delivery | `true` |
+| `METRICS_URL` | Bind URL for the metrics-only HTTP server | `http://127.0.0.1:8001` |
 | `GPU_METRICS_ENABLED` | Collect whole-GPU metrics through NVIDIA NVML when available | `true` |
+| `LOKI_URL` | Base URL for direct application-to-Loki log delivery | `http://127.0.0.1:3100` |
+| `LOG_LEVEL` | Minimum level sent to the terminal and Loki | `INFO` |
 
 The frontend has a separate optional `VITE_BACKEND_URL`; it is documented in the [frontend guide](frontend/README.md).
 
@@ -168,9 +169,10 @@ For browser-client installation and startup, follow [`frontend/README.md`](front
 
 ## Local observability
 
-The agent exposes Prometheus metrics from a separate metrics-only HTTP server.
-The application server remains bound to `127.0.0.1:7860`, while metrics use
-the address and port configured by `METRICS_HOST` and `METRICS_PORT`.
+The agent exposes Prometheus metrics from a separate metrics-only HTTP server
+and sends structured logs directly to Loki. The application server remains
+bound to `127.0.0.1:7860`, while metrics use the bind URL configured by
+`METRICS_URL`.
 
 The exporter includes:
 
@@ -188,7 +190,17 @@ System CPU/RAM metrics describe the machine and the Pipecat process. GPU
 metrics describe each complete GPU. They do not attribute usage to individual
 Ollama, vLLM, or TTS processes.
 
-### Start Prometheus and Grafana
+For streaming services, TTFB is the primary response-start measurement. TTFA
+is the closest available measurement of when synthesized speech becomes
+audible. Full processing duration measures work through the end of a streamed
+response and can therefore be much longer than the delay perceived by a user.
+
+Structured agent and Pipecat logs carry a generated `session_id` for every
+WebSocket connection. The application sends them to Loki through its HTTP API
+without file storage. A bounded in-memory queue prevents logging from blocking
+the pipeline; records are dropped if the queue fills or Loki rejects a batch.
+
+### Start Prometheus, Loki, and Grafana
 
 Prometheus in Docker Desktop reaches the host through
 `host.docker.internal`. The metrics server must therefore listen beyond the
@@ -197,33 +209,40 @@ dashboard:
 
 ```env
 OBSERVABILITY_ENABLED=true
-METRICS_HOST=0.0.0.0
-METRICS_PORT=8001
+METRICS_URL=http://0.0.0.0:8001
 GPU_METRICS_ENABLED=true
+LOKI_URL=http://127.0.0.1:3100
+LOG_LEVEL=INFO
 ```
 
 This exposes read-only system and agent metrics on the local network interface.
 Do not publish port `8001` through a router or expose it to an untrusted
-network. Keep `METRICS_HOST=127.0.0.1` when Prometheus runs directly on the
-host or observability is not in use.
+network. Keep `METRICS_URL=http://127.0.0.1:8001` when Prometheus runs
+directly on the host or observability is not in use. Loki port `3100` is
+published only on host loopback.
 
-Start the backend, then verify the metrics endpoint:
+Start the provisioned observability stack before the backend so startup logs
+can be retained:
+
+```sh
+docker compose -f compose.observability.yaml up -d
+curl http://127.0.0.1:3100/ready
+```
+
+Start the backend in another terminal, then verify its metrics endpoint:
 
 ```sh
 uv run python server.py
 curl http://127.0.0.1:8001/metrics
 ```
 
-Start the provisioned observability stack in another terminal:
-
-```sh
-docker compose -f compose.observability.yaml up -d
-```
-
 Open Grafana at `http://localhost:3000`, sign in with `admin` / `admin`, then
-open **Dashboards → Pipecat Local Agent → Local Agent Performance**. Prometheus
-is available at `http://localhost:9090`. Both services bind their published
-ports to host loopback, and their data is retained in named Docker volumes.
+open either **Local Agent Performance** or **Local Agent Logs** under the
+**Pipecat Local Agent** folder. The logs dashboard accepts a session ID from
+the structured logs as a filter. Prometheus is available at
+`http://localhost:9090`, and Loki at `http://localhost:3100`. All published
+ports bind to host loopback, and backend data is retained in named Docker
+volumes.
 
 Stop the stack without removing its stored data:
 

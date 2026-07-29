@@ -209,9 +209,9 @@ host or observability is not in use.
 
 Start the backend, then verify the metrics endpoint:
 
-```powershell
+```sh
 uv run python server.py
-Invoke-WebRequest http://127.0.0.1:8001/metrics
+curl http://127.0.0.1:8001/metrics
 ```
 
 Start the provisioned observability stack in another terminal:

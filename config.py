@@ -61,6 +61,34 @@ def _env_value(name: str, default: str) -> str:
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized_value = value.strip().casefold()
+    if normalized_value in {"1", "true", "yes", "on"}:
+        return True
+    if normalized_value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of: true, false, 1, 0, yes, no, on, off"
+    )
+
+
+def _env_port(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return port
+
+
 TTSModel = Literal[
     "xtts",
     "chatterbox",
@@ -108,12 +136,21 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class ObservabilityConfig:
+    enabled: bool
+    metrics_host: str
+    metrics_port: int
+    gpu_metrics_enabled: bool
+
+
+@dataclass(frozen=True)
 class AppConfig:
     agent_language: Language
     agent_language_name: str
     whisper_model: Model
     llm: LLMConfig
     tts: TTSConfig
+    observability: ObservabilityConfig
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -163,6 +200,12 @@ class AppConfig:
                 model=tts_model,
                 base_url=_env_value("TTS_BASE_URL", default_tts_base_url),
                 voice=_env_value("TTS_VOICE", default_tts_voice),
+            ),
+            observability=ObservabilityConfig(
+                enabled=_env_bool("OBSERVABILITY_ENABLED", True),
+                metrics_host=_env_value("METRICS_HOST", "127.0.0.1"),
+                metrics_port=_env_port("METRICS_PORT", 8001),
+                gpu_metrics_enabled=_env_bool("GPU_METRICS_ENABLED", True),
             ),
         )
 

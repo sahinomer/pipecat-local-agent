@@ -1,3 +1,7 @@
+import asyncio
+import time
+from contextlib import asynccontextmanager
+
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, WebSocket
@@ -24,6 +28,7 @@ from pipecat.workers.runner import WorkerRunner
 
 # Custom Imports
 from config import config
+from observability import METRICS, MetricsHttpServer, PrometheusMetricsObserver
 from prompts import load_prompt
 from services import ChatterboxTTSService, VLLMService
 from processor import Wav2ArkitBlendshapeProcessor
@@ -37,12 +42,36 @@ INITIAL_PROMPT = load_prompt(
     agent_language=config.agent_language_name,
 )
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    metrics_server = None
+    if config.observability.enabled:
+        METRICS.set_gpu_enabled(config.observability.gpu_metrics_enabled)
+        metrics_server = MetricsHttpServer(
+            host=config.observability.metrics_host,
+            port=config.observability.metrics_port,
+            registry=METRICS.registry,
+        )
+        metrics_server.start()
+
+    try:
+        yield
+    finally:
+        if metrics_server is not None:
+            metrics_server.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    connection_started = time.perf_counter()
+    connection_outcome = "completed"
+    METRICS.connections_active.inc()
+    METRICS.connections_total.inc()
 
     try:
         # 1. Transport with Custom Serializer
@@ -132,13 +161,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 ]
             )
 
+            observers = [RTVIObserver(rtvi)]
+            if config.observability.enabled:
+                observers.append(PrometheusMetricsObserver())
+
             worker = PipelineWorker(
                 pipeline,
                 params=PipelineParams(
                     enable_metrics=True,
                     enable_usage_metrics=True,
+                    send_initial_empty_metrics=False,
                 ),
-                observers=[RTVIObserver(rtvi)],
+                observers=observers,
             )
 
             @transport.event_handler("on_client_connected")
@@ -151,6 +185,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             @transport.event_handler("on_client_disconnected")
             async def on_client_disconnected(transport, client):
+                nonlocal connection_outcome
+                connection_outcome = "client_disconnected"
                 logger.info(f"Client disconnected")
                 await worker.cancel()
 
@@ -158,8 +194,21 @@ async def websocket_endpoint(websocket: WebSocket):
             await runner.add_workers(worker)
             await runner.run()
 
+    except asyncio.CancelledError:
+        if connection_outcome != "client_disconnected":
+            connection_outcome = "cancelled"
+        raise
     except Exception as e:
+        connection_outcome = "error"
         logger.error(f"Error in websocket session: {e}")
+    finally:
+        METRICS.connections_active.dec()
+        METRICS.connection_terminations_total.labels(
+            outcome=connection_outcome
+        ).inc()
+        METRICS.connection_duration_seconds.observe(
+            time.perf_counter() - connection_started
+        )
 
 
 if __name__ == "__main__":

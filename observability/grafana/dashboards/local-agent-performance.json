@@ -656,88 +656,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 14
-      },
-      "id": 10,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum by (le, processor) (rate(local_agent_pipeline_duration_seconds_bucket{metric=\"processing\"}[$__rate_interval])))",
-          "legendFormat": "{{processor}} p50",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(local_agent_pipeline_duration_seconds_bucket{metric=\"processing\"}[$__rate_interval])))",
-          "legendFormat": "{{processor}} p95",
-          "refId": "B"
-        }
-      ],
-      "title": "Processing duration",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "description": "Total processor work from start through completion. For streaming services this includes the complete response and is not the user-perceived response-start delay.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -783,6 +702,94 @@
         "x": 8,
         "y": 14
       },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, processor) (rate(local_agent_pipeline_duration_seconds_bucket{metric=\"processing\"}[$__rate_interval])))",
+          "legendFormat": "{{processor}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(local_agent_pipeline_duration_seconds_bucket{metric=\"processing\"}[$__rate_interval])))",
+          "legendFormat": "{{processor}} p95",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (processor) (rate(local_agent_pipeline_duration_seconds_sum{metric=\"processing\"}[$__rate_interval])) / clamp_min(sum by (processor) (rate(local_agent_pipeline_duration_seconds_count{metric=\"processing\"}[$__rate_interval])), 0.000001)",
+          "legendFormat": "{{processor}} exact mean",
+          "refId": "C"
+        }
+      ],
+      "title": "Full streamed processing duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Primary response-start latency for streaming services: request start until the first response chunk.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
       "id": 11,
       "options": {
         "legend": {
@@ -810,9 +817,14 @@
           "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(local_agent_pipeline_duration_seconds_bucket{metric=\"ttfb\"}[$__rate_interval])))",
           "legendFormat": "{{processor}} p95",
           "refId": "B"
+        },
+        {
+          "expr": "sum by (processor) (rate(local_agent_pipeline_duration_seconds_sum{metric=\"ttfb\"}[$__rate_interval])) / clamp_min(sum by (processor) (rate(local_agent_pipeline_duration_seconds_count{metric=\"ttfb\"}[$__rate_interval])), 0.000001)",
+          "legendFormat": "{{processor}} exact mean",
+          "refId": "C"
         }
       ],
-      "title": "Time to first byte",
+      "title": "Streaming response latency (TTFB)",
       "type": "timeseries"
     },
     {
@@ -820,6 +832,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "TTFA is the closest available measure of when synthesized speech becomes audible; the remaining series show aggregation and turn-analysis work.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -889,7 +902,7 @@
           "refId": "A"
         }
       ],
-      "title": "Conversational latency components",
+      "title": "First-audio and turn latency",
       "type": "timeseries"
     },
     {
@@ -1088,7 +1101,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "All built-in and custom processors that emit Pipecat processing metrics appear automatically.",
+      "description": "Full work duration for all built-in and custom processors that emit Pipecat processing metrics. Streaming responses can be audible before this work finishes.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1174,9 +1187,14 @@
           "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(local_agent_pipeline_duration_seconds_bucket{metric=\"processing\"}[$__rate_interval])))",
           "legendFormat": "{{processor}} p95",
           "refId": "B"
+        },
+        {
+          "expr": "sum by (processor) (rate(local_agent_pipeline_duration_seconds_sum{metric=\"processing\"}[$__rate_interval])) / clamp_min(sum by (processor) (rate(local_agent_pipeline_duration_seconds_count{metric=\"processing\"}[$__rate_interval])), 0.000001)",
+          "legendFormat": "{{processor}} exact mean",
+          "refId": "C"
         }
       ],
-      "title": "Per-processor duration",
+      "title": "Full per-processor duration",
       "type": "timeseries"
     },
     {

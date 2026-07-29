@@ -3,7 +3,8 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
-from pipecat.frames.frames import TTSAudioRawFrame
+from pipecat.frames.frames import ErrorFrame, MetricsFrame, TTSAudioRawFrame
+from pipecat.metrics.metrics import ProcessingMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
 
@@ -120,7 +121,7 @@ class Wav2ArkitBlendshapeProcessorTests(unittest.IsolatedAsyncioTestCase):
         model.predict.return_value = [[0.1, 0.2], [0.3, 0.4]]
         processor = Wav2ArkitBlendshapeProcessor(model=model)
         processor.push_frame = AsyncMock()
-        frame = _audio_frame([0, 16384])
+        frame = _audio_frame([0] * 1600)
         frame.pts = 1234
 
         await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
@@ -143,7 +144,7 @@ class Wav2ArkitBlendshapeProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(second_call.args[1], FrameDirection.DOWNSTREAM)
 
         audio_input = model.predict.call_args.args[0]
-        np.testing.assert_allclose(audio_input, [[0.0, 0.5]])
+        np.testing.assert_allclose(audio_input, np.zeros((1, 1600)))
 
     async def test_upstream_audio_is_only_forwarded(self):
         model = Mock()
@@ -166,23 +167,54 @@ class Wav2ArkitBlendshapeProcessorTests(unittest.IsolatedAsyncioTestCase):
         processor.push_frame = AsyncMock()
         frame = _audio_frame([0])
 
-        with patch(
-            "processor.wav2arkit_blendshape.logger.exception"
-        ) as log_exception:
-            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+        await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        processor.push_frame.assert_awaited_once_with(
-            frame,
+        self.assertEqual(processor.push_frame.await_count, 2)
+        audio_call, error_call = processor.push_frame.await_args_list
+        self.assertEqual(
+            audio_call.args,
+            (frame, FrameDirection.DOWNSTREAM),
+        )
+        self.assertIsInstance(error_call.args[0], ErrorFrame)
+        self.assertEqual(
+            error_call.args[0].error,
+            "Wav2Arkit processing failed",
+        )
+        self.assertIsInstance(error_call.args[0].exception, RuntimeError)
+        self.assertIs(error_call.args[1], FrameDirection.UPSTREAM)
+
+    def test_processor_supports_pipecat_metrics(self):
+        processor = Wav2ArkitBlendshapeProcessor(model=Mock())
+
+        self.assertTrue(processor.can_generate_metrics())
+
+    async def test_processor_emits_pipecat_processing_metrics(self):
+        model = Mock()
+        model.predict.return_value = [[0.1, 0.2]]
+        processor = Wav2ArkitBlendshapeProcessor(model=model)
+        processor._enable_metrics = True
+        processor.push_frame = AsyncMock()
+
+        await processor.process_frame(
+            _audio_frame([0]),
             FrameDirection.DOWNSTREAM,
         )
-        log_exception.assert_called_once()
+
+        metrics_frame = processor.push_frame.await_args_list[-1].args[0]
+        self.assertIsInstance(metrics_frame, MetricsFrame)
+        self.assertEqual(len(metrics_frame.data), 1)
+        self.assertIsInstance(metrics_frame.data[0], ProcessingMetricsData)
+        self.assertEqual(metrics_frame.data[0].processor, processor.name)
 
     def test_model_and_session_cannot_both_be_injected(self):
         with self.assertRaisesRegex(
             ValueError,
             "model and session cannot both be provided",
         ):
-            Wav2ArkitBlendshapeProcessor(model=Mock(), session=Mock())
+            Wav2ArkitBlendshapeProcessor(
+                model=Mock(),
+                session=Mock(),
+            )
 
 
 if __name__ == "__main__":

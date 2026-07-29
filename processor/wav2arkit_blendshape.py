@@ -74,7 +74,9 @@ class Wav2ArkitBlendshapeModel:
     _load_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, *, session: Optional[InferenceSession] = None):
-        self._session: InferenceSession = session if session is not None else self._get_shared_session()
+        self._session: InferenceSession = (
+            session if session is not None else self._get_shared_session()
+        )
 
     @classmethod
     def _get_shared_session(cls) -> InferenceSession:
@@ -164,16 +166,22 @@ class Wav2ArkitBlendshapeProcessor(FrameProcessor):
     """
 
     def __init__(
-            self,
-            *,
-            model: Optional[BlendshapeModel] = None,
-            session: Optional[InferenceSession] = None,
+        self,
+        *,
+        model: Optional[BlendshapeModel] = None,
+        session: Optional[InferenceSession] = None,
     ):
         super().__init__()
 
         if model is not None and session is not None:
             raise ValueError("model and session cannot both be provided")
-        self._model = model or Wav2ArkitBlendshapeModel(session=session)
+        self._model = (
+            model if model is not None
+            else Wav2ArkitBlendshapeModel(session=session)
+        )
+
+    def can_generate_metrics(self) -> bool:
+        return True
 
     @staticmethod
     def _audio_input(frame: TTSAudioRawFrame) -> np.ndarray:
@@ -226,19 +234,26 @@ class Wav2ArkitBlendshapeProcessor(FrameProcessor):
             frame.num_channels,
         )
 
+        await self.start_processing_metrics()
+
         try:
             blendshapes = await asyncio.to_thread(self._infer_blendshapes, frame)
-        except Exception:
-            logger.exception("{}: wav2arkit inference failed", self)
-            return
-
-        await self.push_frame(
-            RTVIServerMessageFrame(
-                data={
-                    "type": "blendshapes",
-                    "data": blendshapes,
-                    "pts": frame.pts,
-                }
-            ),
-            direction,
-        )
+            await self.push_frame(
+                RTVIServerMessageFrame(
+                    data={
+                        "type": "blendshapes",
+                        "data": blendshapes,
+                        "pts": frame.pts,
+                    }
+                ),
+                direction,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.push_error(
+                "Wav2Arkit processing failed",
+                exception=exc,
+            )
+        finally:
+            await self.stop_processing_metrics()

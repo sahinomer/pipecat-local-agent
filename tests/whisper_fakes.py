@@ -84,7 +84,7 @@ class FakeWhisperModel:
         self.max_active = 0
         self._lock = threading.Lock()
 
-    def transcribe(self, audio, *, language=None, hotwords=None, initial_prompt=None):
+    def transcribe(self, audio, *, language=None, hotwords=None, initial_prompt=None, beam_size=5):
         marker = audio_marker(audio)
         with self._lock:
             self.calls.append(
@@ -93,6 +93,7 @@ class FakeWhisperModel:
                     "language": language,
                     "hotwords": hotwords,
                     "initial_prompt": initial_prompt,
+                    "beam_size": beam_size,
                     "dtype": audio.dtype,
                 }
             )
@@ -126,3 +127,113 @@ async def wait_until(predicate, *, timeout: float = 2.0, interval: float = 0.005
         if time.monotonic() > deadline:
             raise AssertionError("condition not met before timeout")
         await asyncio.sleep(interval)
+
+
+class FakeCT2Whisper:
+    """Stands in for the CTranslate2 Whisper model under faster-whisper.
+
+    ``generate`` reads each row's marker back from its features and its
+    language from its prompt, so a result that lands on the wrong request
+    is visible. Every call is recorded with its batch size and options.
+
+    Args:
+        gate: When given, the first ``generate`` waits until it is set, so
+            later requests pile up behind it.
+        delay: Seconds each ``generate`` takes.
+        poison_markers: Markers whose presence in a batch makes it fail.
+    """
+
+    def __init__(
+        self,
+        *,
+        gate: threading.Event | None = None,
+        delay: float = 0.0,
+        poison_markers: frozenset[int] = frozenset(),
+    ):
+        self.gate = gate
+        self.delay = delay
+        self.poison_markers = poison_markers
+        self.encode_batches: list[int] = []
+        self.generate_calls: list[dict] = []
+        self.is_multilingual = True
+        self.device = "cpu"
+        self.device_index = [0]
+        self._lock = threading.Lock()
+        self._gate_used = False
+
+    def encode(self, features, to_cpu=False):
+        array = np.asarray(features)
+        with self._lock:
+            self.encode_batches.append(array.shape[0])
+        return SimpleNamespace(markers=[int(round(float(row[0, 0]))) for row in array])
+
+    def generate(self, encoder_output, prompts, **kwargs):
+        with self._lock:
+            first = not self._gate_used
+            self._gate_used = True
+        if first and self.gate is not None and not self.gate.wait(timeout=5):
+            raise TimeoutError("test gate was never opened")
+        if self.delay:
+            time.sleep(self.delay)
+        markers = encoder_output.markers
+        with self._lock:
+            self.generate_calls.append(
+                {"rows": len(prompts), "markers": list(markers), "kwargs": dict(kwargs)}
+            )
+        if self.poison_markers.intersection(markers):
+            raise RuntimeError(f"batch with poison marker {sorted(self.poison_markers)}")
+        return [
+            SimpleNamespace(
+                sequences_ids=[[prompt[0], marker]],
+                scores=[-0.1],
+                no_speech_prob=0.0,
+            )
+            for prompt, marker in zip(prompts, markers)
+        ]
+
+
+class FakeFasterWhisper:
+    """Stands in for ``faster_whisper.WhisperModel`` on top of a CTranslate2 fake.
+
+    Like the real one, ``transcribe`` returns a lazy generator that calls
+    ``self.encode`` and then ``self.model.generate`` once per decode, so a
+    batched engine can substitute both. Requests whose marker is in
+    ``fallback_markers`` decode a second time with sampling options, the way
+    faster-whisper retries at a higher temperature.
+    """
+
+    def __init__(self, ct2: FakeCT2Whisper, *, fallback_markers: frozenset[int] = frozenset()):
+        self.model = ct2
+        self.fallback_markers = fallback_markers
+        self.supported_languages = ["en", "tr"]
+
+    def encode(self, features):
+        import ctranslate2
+
+        return self.model.encode(ctranslate2.StorageView.from_array(features[None]))
+
+    def transcribe(self, audio, *, language=None, hotwords=None, initial_prompt=None, beam_size=5):
+        marker = audio_marker(audio)
+        features = np.full((4, 8), marker, dtype=np.float32)
+        prompt = [language, hotwords, initial_prompt]
+
+        def decode():
+            encoder_output = self.encode(features)
+            result = self.model.generate(
+                encoder_output, [prompt], beam_size=beam_size, return_scores=True
+            )[0]
+            if marker in self.fallback_markers:
+                result = self.model.generate(
+                    encoder_output,
+                    [prompt],
+                    beam_size=1,
+                    sampling_temperature=0.2,
+                    return_scores=True,
+                )[0]
+            decoded_language, decoded_marker = result.sequences_ids[0]
+            yield SimpleNamespace(
+                text=f"{decoded_language}:{decoded_marker}",
+                no_speech_prob=result.no_speech_prob,
+            )
+
+        return decode(), None

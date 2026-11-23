@@ -18,6 +18,8 @@ class SegmentResult:
     queue_wait_secs: float | None
     inference_secs: float | None
     error: str | None
+    batch_wait_secs: float | None = None
+    batch_size: int | None = None
 
     @classmethod
     def from_message(cls, message: dict[str, Any]) -> "SegmentResult":
@@ -30,6 +32,8 @@ class SegmentResult:
             queue_wait_secs=message.get("queue_wait_secs"),
             inference_secs=message.get("inference_secs"),
             error=message.get("error"),
+            batch_wait_secs=message.get("batch_wait_secs"),
+            batch_size=message.get("batch_size"),
         )
 
 
@@ -136,6 +140,11 @@ def gpu_peak(samples: list[dict[str, Any]], key: str) -> float | None:
     )
 
 
+def _engine_delta(samples: list[dict[str, Any]], key: str) -> float | None:
+    values = [s["engine"][key] for s in samples if key in s.get("engine", {})]
+    return values[-1] - values[0] if len(values) >= 2 else None
+
+
 def summarize_step(
     sessions: list[SessionResult],
     stats_samples: list[dict[str, Any]],
@@ -151,6 +160,9 @@ def summarize_step(
     latencies = [seg.latency_secs for seg in ok_segments if seg.latency_secs is not None]
     queue_waits = [seg.queue_wait_secs for seg in ok_segments if seg.queue_wait_secs is not None]
     inference = [seg.inference_secs for seg in ok_segments if seg.inference_secs is not None]
+    batch_waits = [seg.batch_wait_secs for seg in ok_segments if seg.batch_wait_secs is not None]
+    batches = _engine_delta(stats_samples, "batches")
+    batched_items = _engine_delta(stats_samples, "batched_items")
     rtf = [
         seg.inference_secs / seg.audio_secs
         for seg in ok_segments
@@ -200,6 +212,10 @@ def summarize_step(
         "queue_wait_max": max(queue_waits) if queue_waits else None,
         "inference_p50": percentile(inference, 50),
         "inference_p95": percentile(inference, 95),
+        "batch_wait_p95": percentile(batch_waits, 95),
+        "batch_size_mean": batched_items / batches if batches else None,
+        "peak_batch_size": _peak(stats_samples, lambda s: s["engine"].get("last_batch_size")),
+        "peak_batch_pending": _peak(stats_samples, lambda s: s["engine"].get("batch_pending")),
         "rtf_p50": percentile(rtf, 50),
         "setup_max": max((s.setup_secs for s in sessions if s.setup_secs is not None), default=None),
         "drift_wer_mean": sum(drift) / len(drift) if drift else None,

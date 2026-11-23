@@ -57,6 +57,7 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
                     "language": "tr",
                     "hotwords": "pipecat",
                     "initial_prompt": "previous turn",
+                    "beam_size": 5,
                     "dtype": np.float32,
                 }
             ],

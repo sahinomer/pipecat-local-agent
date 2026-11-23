@@ -366,8 +366,13 @@ def _stats_line(sample: dict[str, Any] | None, poller: StatsPoller) -> str:
         return f"server stats unavailable: {poller.error or 'waiting'}"
     engine = sample["engine"]
     system = sample["system"]
-    parts = [f"engine {engine['mode']} {engine['model']}"]
-    if "workers" in engine:
+    parts = [f"engine {engine['mode']} {engine['model']} beam {engine.get('beam_size', 5)}"]
+    if engine.get("max_batch_size", 1) > 1:
+        parts.append(
+            f"batch last {engine['last_batch_size']}/{engine['max_batch_size']} "
+            f"waiting {engine['batch_pending']} | requests queued {engine['queued']}"
+        )
+    elif "workers" in engine:
         parts.append(
             f"workers {engine['workers']} | queued {engine['queued']} "
             f"running {engine['running']}"
@@ -449,6 +454,7 @@ class View:
                 f"{_fmt(summary['latency_p95'])}/{_fmt(summary['latency_max'])}s "
                 f"queue p95={_fmt(summary['queue_wait_p95'])}s "
                 f"infer p50={_fmt(summary['inference_p50'])}s "
+                f"batch mean={_fmt(summary.get('batch_size_mean'), '', 1)} "
                 f"peak GPU={_fmt(summary['peak_gpu_percent'], '%', 0)} "
                 f"{_fmt(summary['peak_gpu_memory_mb'], 'MB', 0)} "
                 f"drift max={_fmt(summary['drift_wer_max'])} "
@@ -571,7 +577,8 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
             table = Table(
                 title=(
                     "summary - seconds unless noted; lat = VAD stop -> transcript, "
-                    "q = engine queue wait, inf = inference, drift = max WER vs solo "
+                    "q = engine queue wait, inf = inference, batch = mean batch size, "
+                    "drift = max WER vs solo "
                     "baseline, refWER = mean WER vs .txt references"
                 ),
                 title_justify="left",
@@ -580,7 +587,7 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
             table.add_column("step", no_wrap=True, min_width=8)
             for name in (
                 "sess", "segs", "err", "lat50", "lat95", "latmax", "q95",
-                "inf50", "queued", "gpu%", "gpuMB", "cpu%", "lag ms", "drift", "refWER",
+                "inf50", "queued", "batch", "gpu%", "gpuMB", "cpu%", "lag ms", "drift", "refWER",
             ):
                 table.add_column(name, justify="right", no_wrap=True)
             for label, s in rows:
@@ -596,6 +603,7 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
                     _fmt(s["queue_wait_p95"]),
                     _fmt(s["inference_p50"]),
                     _fmt(s["peak_queued"], "", 0),
+                    _fmt(s.get("batch_size_mean"), "", 1),
                     _fmt(s["peak_gpu_percent"], "", 0),
                     _fmt(s["peak_gpu_memory_mb"], "", 0),
                     _fmt(s["peak_cpu_percent"], "", 0),
@@ -670,8 +678,12 @@ async def run(args: argparse.Namespace) -> int:
         engine = server_info["engine"]
         view.print(
             f"server: engine={engine['mode']} model={engine['model']} "
-            f"language={engine['language']}"
-            + (f" workers={engine['workers']}" if "workers" in engine else "")
+            f"language={engine['language']} beam_size={engine.get('beam_size', 5)}"
+            + (
+                f" max_batch_size={engine['max_batch_size']}"
+                if engine.get("max_batch_size", 1) > 1
+                else (f" workers={engine['workers']}" if "workers" in engine else "")
+            )
         )
         view.print(
             f"{len(clips)} file(s), {sum(c.duration_secs for c in clips):.1f}s of audio; "

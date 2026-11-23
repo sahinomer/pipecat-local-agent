@@ -11,6 +11,7 @@ way a real session would segment it.
 Run from the repository root:
 
     uv run python -m benchmarks.whisper.server --engine shared
+    uv run python -m benchmarks.whisper.server --engine batched --max-batch-size 4
 """
 
 import argparse
@@ -38,13 +39,13 @@ from pipecat.transports.websocket.fastapi import (
 from pipecat.workers.runner import WorkerRunner
 
 from config import _resolve_language, config
-from services.whisper import SharedWhisperEngine, WhisperEngineConfig
+from services.whisper import WhisperEngineConfig, load_whisper_engine
 
 from . import protocol
 from .stt import BenchPerSessionWhisperSTTService, BenchSharedWhisperSTTService, BenchState
 from .telemetry import LoopLagMonitor, SystemSampler
 
-ENGINE_MODES = ("shared", "per-session")
+ENGINE_MODES = ("shared", "batched", "per-session")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -55,8 +56,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--engine",
         choices=ENGINE_MODES,
         default="shared",
-        help="shared: one model for all sessions; per-session: Pipecat's "
-        "WhisperSTTService, one model per connection (the agent's current behavior)",
+        help="shared: one model for all sessions, one transcription at a time per "
+        "worker; batched: one model, decode calls batched across sessions; "
+        "per-session: Pipecat's WhisperSTTService, one model per connection "
+        "(the agent's current behavior)",
     )
     parser.add_argument("--model", default=config.whisper_model.value)
     parser.add_argument(
@@ -72,6 +75,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="shared engine only: transcriptions that may run at once",
     )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        help="shared and batched engines; 1 is greedy. per-session always uses 5",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=4,
+        help="batched engine only: decode calls the GPU runs together",
+    )
+    parser.add_argument(
+        "--max-batch-wait-ms",
+        type=float,
+        default=0.0,
+        help="batched engine only: how long a short batch may wait for more requests",
+    )
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7870)
@@ -82,7 +103,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def create_app(args: argparse.Namespace) -> FastAPI:
     language: Language = _resolve_language(args.language)
-    state = BenchState(engine_mode=args.engine, model=args.model, language=language.value)
+    state = BenchState(
+        engine_mode=args.engine,
+        model=args.model,
+        language=language.value,
+        beam_size=5 if args.engine == "per-session" else args.beam_size,
+    )
     sampler = SystemSampler(gpu_enabled=not args.no_gpu_stats)
     loop_lag = LoopLagMonitor()
 
@@ -91,14 +117,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         sampler.start()
         loop_lag.start()
         engine = None
-        if args.engine == "shared":
-            engine = await SharedWhisperEngine.load(
+        if args.engine in ("shared", "batched"):
+            batched = args.engine == "batched"
+            engine = await load_whisper_engine(
                 WhisperEngineConfig(
                     model=args.model,
                     device=args.device,
                     compute_type=args.compute_type,
-                    num_workers=args.workers,
+                    num_workers=1 if batched else args.workers,
                     cpu_threads=args.cpu_threads,
+                    beam_size=args.beam_size,
+                    # A batch size of 1 would select the unbatched engine.
+                    max_batch_size=max(2, args.max_batch_size) if batched else 1,
+                    max_batch_wait_ms=args.max_batch_wait_ms if batched else 0.0,
                 )
             )
             # Warm up so the first session doesn't pay for CUDA initialization.
@@ -108,10 +139,12 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             )
             state.engine = engine
         logger.info(
-            "Benchmark server ready: engine={} model={} language={}",
+            "Benchmark server ready: engine={} model={} language={} beam_size={}{}",
             args.engine,
             args.model,
             language.value,
+            state.beam_size,
+            f" max_batch_size={args.max_batch_size}" if args.engine == "batched" else "",
         )
         try:
             yield
@@ -140,7 +173,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     def create_stt():
         settings_cls = BenchSharedWhisperSTTService.Settings
-        if args.engine == "shared":
+        if args.engine in ("shared", "batched"):
             return BenchSharedWhisperSTTService(
                 engine=state.engine,
                 bench_state=state,

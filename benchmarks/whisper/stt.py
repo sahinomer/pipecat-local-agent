@@ -35,6 +35,7 @@ class BenchState:
     engine_mode: str
     model: str
     language: str
+    beam_size: int = 5
     engine: WhisperEngine | None = None
     sessions_active: int = 0
     sessions_total: int = 0
@@ -49,6 +50,7 @@ class BenchState:
             "mode": self.engine_mode,
             "model": self.model,
             "language": self.language,
+            "beam_size": self.beam_size,
         }
         if self.engine is not None:
             stats = self.engine.stats()
@@ -59,6 +61,11 @@ class BenchState:
                 completed=stats.completed,
                 failed=stats.failed,
                 cancelled=stats.cancelled,
+                max_batch_size=stats.max_batch_size,
+                batch_pending=stats.batch_pending,
+                batches=stats.batches,
+                batched_items=stats.batched_items,
+                last_batch_size=stats.last_batch_size,
             )
         else:
             # Each session owns a model; there is no shared queue.
@@ -164,7 +171,9 @@ class SegmentReportingMixin:
 
         finished_at = time.perf_counter()
         stt_secs = finished_at - started_at
-        queue_wait_secs, inference_secs = self._bench_timings(stt_secs)
+        queue_wait_secs, inference_secs, batch_wait_secs, batch_size = self._bench_timings(
+            stt_secs
+        )
         yield self._bench_frame(
             {
                 "type": protocol.SEGMENT,
@@ -175,13 +184,17 @@ class SegmentReportingMixin:
                 "stt_secs": stt_secs,
                 "queue_wait_secs": queue_wait_secs,
                 "inference_secs": inference_secs,
+                "batch_wait_secs": batch_wait_secs,
+                "batch_size": batch_size,
                 "error": error,
             }
         )
 
-    def _bench_timings(self, stt_secs: float) -> tuple[float | None, float | None]:
-        """Queue wait and inference time of the segment just transcribed."""
-        return None, stt_secs
+    def _bench_timings(
+        self, stt_secs: float
+    ) -> tuple[float | None, float | None, float | None, int | None]:
+        """Queue wait, inference, batch wait and batch size of the last segment."""
+        return None, stt_secs, None, None
 
     def _bench_frame(self, message: dict[str, Any]) -> OutputTransportMessageUrgentFrame:
         return OutputTransportMessageUrgentFrame(message=message)
@@ -191,13 +204,18 @@ class SegmentReportingMixin:
 
 
 class BenchSharedWhisperSTTService(SegmentReportingMixin, SharedWhisperSTTService):
-    """The shared-engine service, reporting queue wait and inference time."""
+    """The shared or batched engine service, reporting where each segment's time went."""
 
-    def _bench_timings(self, stt_secs: float) -> tuple[float | None, float | None]:
+    def _bench_timings(self, stt_secs: float):
         result = self.last_transcription
         if result is None:
-            return None, None
-        return result.queue_wait_secs, result.inference_secs
+            return None, None, None, None
+        return (
+            result.queue_wait_secs,
+            result.inference_secs,
+            result.batch_wait_secs,
+            result.batch_size,
+        )
 
 
 class BenchPerSessionWhisperSTTService(SegmentReportingMixin, WhisperSTTService):

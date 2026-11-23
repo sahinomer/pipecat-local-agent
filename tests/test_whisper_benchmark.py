@@ -31,8 +31,8 @@ from benchmarks.whisper.report import (
     summarize_step,
     word_error_rate,
 )
-from services.whisper import SharedWhisperEngine
-from whisper_fakes import FakeWhisperModel
+from services.whisper import BatchedWhisperEngine, SharedWhisperEngine
+from whisper_fakes import FakeCT2Whisper, FakeFasterWhisper, FakeWhisperModel
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -278,7 +278,7 @@ class BenchmarkServerEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addCleanup(engine.close)
         with (
-            patch.object(server.SharedWhisperEngine, "load", AsyncMock(return_value=engine)),
+            patch.object(server, "load_whisper_engine", AsyncMock(return_value=engine)),
             patch.object(server, "SileroVADAnalyzer", EnergyVADAnalyzer),
         ):
             opts = await self._serve("--engine", "shared")
@@ -311,6 +311,40 @@ class BenchmarkServerEndToEndTests(unittest.IsolatedAsyncioTestCase):
         # Six segments plus the warm-up request at startup.
         self.assertEqual(stats["engine"]["completed"], 7)
         self.assertEqual(stats["segments"], {"in_flight": 0, "completed": 6, "failed": 0})
+
+    async def test_batched_engine_reports_batch_sizes_per_segment(self):
+        engine = BatchedWhisperEngine(
+            FakeFasterWhisper(FakeCT2Whisper(delay=0.05)),
+            model_name="fake-model",
+            max_batch_size=4,
+        )
+        self.addCleanup(engine.close)
+        with (
+            patch.object(server, "load_whisper_engine", AsyncMock(return_value=engine)),
+            patch.object(server, "SileroVADAnalyzer", EnergyVADAnalyzer),
+        ):
+            opts = await self._serve("--engine", "batched")
+            clips = [
+                AudioClip(name=f"c{i}.wav", path=Path(f"c{i}.wav"), pcm=_utterances(1000 * i + 7))
+                for i in range(1, 7)
+            ]
+            sessions = [SessionResult(session=f"s{i}", clip=c.name) for i, c in enumerate(clips)]
+            async with aiohttp.ClientSession() as http:
+                await asyncio.gather(
+                    *(run_session(http, opts, c, s) for c, s in zip(clips, sessions))
+                )
+                async with http.get(opts.stats_url) as response:
+                    stats = await response.json()
+
+        for i, session in zip(range(1, 7), sessions):
+            self.assertEqual(session.state, "done", session.failure)
+            self.assertEqual(session.transcript, f"en:{1000 * i + 7}")
+            (segment,) = session.segments
+            self.assertGreaterEqual(segment.batch_size, 1)
+            self.assertIsNotNone(segment.batch_wait_secs)
+        self.assertEqual(stats["engine"]["mode"], "batched")
+        self.assertEqual(stats["engine"]["max_batch_size"], 4)
+        self.assertGreater(max(s.segments[0].batch_size for s in sessions), 1)
 
     async def test_session_setup_failure_reaches_the_client(self):
         with patch.object(

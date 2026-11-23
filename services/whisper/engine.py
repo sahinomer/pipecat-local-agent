@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import numpy as np
@@ -29,18 +29,27 @@ class WhisperTranscription:
     Parameters:
         segments: The decoded segments, fully consumed.
         queue_wait_secs: Time from submission until a worker picked it up.
-        inference_secs: Time the model spent on it, including feature
-            extraction and decoding.
+        inference_secs: Time the worker spent on it, including feature
+            extraction, decoding and, for a batched engine, batch waits.
+        batch_wait_secs: Batched engine only: time spent waiting for a batch
+            slot on the GPU, summed over the request's decode calls.
+        batch_size: Batched engine only: the largest batch the request's
+            decode calls ran in; ``1`` when it ran alone.
     """
 
     segments: list[Segment]
     queue_wait_secs: float
     inference_secs: float
+    batch_wait_secs: float = 0.0
+    batch_size: int = 1
 
 
 @dataclass(frozen=True)
 class WhisperEngineStats:
-    """A point-in-time view of an engine's load and totals."""
+    """A point-in-time view of an engine's load and totals.
+
+    The ``batch*`` fields stay at their defaults for an unbatched engine.
+    """
 
     workers: int
     queued: int
@@ -48,6 +57,11 @@ class WhisperEngineStats:
     completed: int
     failed: int
     cancelled: int
+    max_batch_size: int = 1
+    batch_pending: int = 0
+    batches: int = 0
+    batched_items: int = 0
+    last_batch_size: int = 0
 
 
 class WhisperEngine(Protocol):
@@ -89,10 +103,17 @@ class WhisperEngineConfig:
         model: A faster-whisper model size, Hugging Face repo, or local path.
         device: ``"cpu"``, ``"cuda"``, or ``"auto"``.
         compute_type: CTranslate2 compute type, e.g. ``"float16"`` or ``"int8"``.
-        num_workers: Transcriptions that may run at once. Each worker is a
-            separate model replica inside CTranslate2, so memory use grows
-            with it. ``1`` runs requests one at a time in arrival order.
+        num_workers: Unbatched engine: transcriptions that may run at once.
+            Each worker is a separate model replica inside CTranslate2, so
+            memory use grows with it. A batched engine needs exactly one.
         cpu_threads: Threads per worker on CPU; ``0`` keeps the library default.
+        beam_size: Beam search width; ``1`` is greedy decoding. faster-whisper
+            and Pipecat use 5.
+        max_batch_size: Decode calls the GPU may run together. ``1`` selects
+            the unbatched :class:`SharedWhisperEngine`.
+        max_batch_wait_ms: Batched engine: how long a batch may wait for more
+            requests before it runs. ``0`` runs whatever is waiting as soon as
+            the GPU is free, which adds no latency when load is light.
     """
 
     model: str
@@ -100,6 +121,9 @@ class WhisperEngineConfig:
     compute_type: str = "default"
     num_workers: int = 1
     cpu_threads: int = 0
+    beam_size: int = 5
+    max_batch_size: int = 1
+    max_batch_wait_ms: float = 0.0
 
     def __post_init__(self):
         if not str(self.model).strip():
@@ -108,6 +132,28 @@ class WhisperEngineConfig:
             raise ValueError("num_workers must be at least 1")
         if self.cpu_threads < 0:
             raise ValueError("cpu_threads cannot be negative")
+        if self.beam_size < 1:
+            raise ValueError("beam_size must be at least 1")
+        if self.max_batch_size < 1:
+            raise ValueError("max_batch_size must be at least 1")
+        if self.max_batch_wait_ms < 0:
+            raise ValueError("max_batch_wait_ms cannot be negative")
+        if self.max_batch_size > 1 and self.num_workers != 1:
+            raise ValueError("a batched engine runs on exactly one model worker")
+
+
+@dataclass
+class RequestContext:
+    """State of one in-flight request, shared with the thread running it.
+
+    ``cancelled`` is set when the caller stops waiting, so a batched engine
+    can drop the request's remaining decode calls. The batch fields are
+    filled in by the batch scheduler.
+    """
+
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    batch_wait_secs: float = 0.0
+    batch_size: int = 1
 
 
 class SharedWhisperEngine:
@@ -133,13 +179,17 @@ class SharedWhisperEngine:
         *,
         model_name: str,
         num_workers: int = 1,
+        beam_size: int = 5,
     ):
         if num_workers < 1:
             raise ValueError("num_workers must be at least 1")
+        if beam_size < 1:
+            raise ValueError("beam_size must be at least 1")
 
         self._model = model
         self._model_name = str(model_name)
         self._num_workers = num_workers
+        self._beam_size = beam_size
         self._executor = ThreadPoolExecutor(
             max_workers=num_workers,
             thread_name_prefix="whisper-engine",
@@ -156,7 +206,7 @@ class SharedWhisperEngine:
     async def load(cls, config: WhisperEngineConfig) -> "SharedWhisperEngine":
         """Return the process-wide engine for ``config``, loading it on first use."""
         return await load_shared_model(
-            ("pipecat-local-agent", "whisper-engine", config),
+            ("pipecat-local-agent", cls.__name__, config),
             lambda: cls.from_config(config),
         )
 
@@ -164,11 +214,12 @@ class SharedWhisperEngine:
     def from_config(cls, config: WhisperEngineConfig) -> "SharedWhisperEngine":
         """Load a new, unshared engine. Blocks while the model loads."""
         logger.info(
-            "Loading shared Whisper model {} (device={}, compute_type={}, workers={})",
+            "Loading Whisper model {} for {} (device={}, compute_type={}, {})",
             config.model,
+            cls.__name__,
             config.device,
             config.compute_type,
-            config.num_workers,
+            cls._describe(config),
         )
         model = WhisperModel(
             config.model,
@@ -177,8 +228,21 @@ class SharedWhisperEngine:
             cpu_threads=config.cpu_threads,
             num_workers=config.num_workers,
         )
-        logger.info("Loaded shared Whisper model {}", config.model)
-        return cls(model, model_name=config.model, num_workers=config.num_workers)
+        logger.info("Loaded Whisper model {}", config.model)
+        return cls._from_model(model, config)
+
+    @classmethod
+    def _describe(cls, config: WhisperEngineConfig) -> str:
+        return f"workers={config.num_workers}, beam_size={config.beam_size}"
+
+    @classmethod
+    def _from_model(cls, model: Any, config: WhisperEngineConfig) -> "SharedWhisperEngine":
+        return cls(
+            model,
+            model_name=config.model,
+            num_workers=config.num_workers,
+            beam_size=config.beam_size,
+        )
 
     @property
     def model_name(self) -> str:
@@ -191,6 +255,10 @@ class SharedWhisperEngine:
     @property
     def num_workers(self) -> int:
         return self._num_workers
+
+    @property
+    def beam_size(self) -> int:
+        return self._beam_size
 
     @property
     def queued(self) -> int:
@@ -235,6 +303,7 @@ class SharedWhisperEngine:
         if self._closed:
             raise RuntimeError("Whisper engine is closed")
 
+        context = RequestContext()
         with self._stats_lock:
             self._queued += 1
         try:
@@ -245,6 +314,7 @@ class SharedWhisperEngine:
                 hotwords,
                 initial_prompt,
                 time.perf_counter(),
+                context,
             )
         except RuntimeError:
             # The executor was shut down between the closed check and submit.
@@ -254,8 +324,13 @@ class SharedWhisperEngine:
         future.add_done_callback(self._forget_if_cancelled)
 
         # Cancelling the awaiting task cancels ``future`` too; a request that
-        # has not started yet is then removed from the queue.
-        return await asyncio.wrap_future(future)
+        # has not started yet is then removed from the queue. One that has
+        # started is told to stop through its context.
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            context.cancelled.set()
+            raise
 
     def close(self) -> None:
         """Refuse new requests and fail the ones still waiting.
@@ -277,6 +352,28 @@ class SharedWhisperEngine:
                 self._queued -= 1
                 self._cancelled += 1
 
+    def _decode(
+        self,
+        audio: np.ndarray,
+        language: str | None,
+        hotwords: str | None,
+        initial_prompt: str | None,
+        context: RequestContext,
+    ) -> list[Segment]:
+        # Only per-request arguments are passed. ``chunk_length`` must never
+        # be passed: faster-whisper stores it on the shared feature
+        # extractor, which would change it for every other session.
+        segments, _info = self._model.transcribe(
+            audio,
+            language=language,
+            hotwords=hotwords,
+            initial_prompt=initial_prompt,
+            beam_size=self._beam_size,
+        )
+        # ``segments`` is lazy and decodes while it is consumed, so consume
+        # it here on the worker thread, not on the event loop.
+        return list(segments)
+
     def _transcribe_blocking(
         self,
         audio: np.ndarray,
@@ -284,6 +381,7 @@ class SharedWhisperEngine:
         hotwords: str | None,
         initial_prompt: str | None,
         submitted_at: float,
+        context: RequestContext,
     ) -> WhisperTranscription:
         started_at = time.perf_counter()
         with self._stats_lock:
@@ -293,21 +391,13 @@ class SharedWhisperEngine:
         try:
             if self._closed:
                 raise RuntimeError("Whisper engine is closed")
-            # Only per-request arguments are passed. ``chunk_length`` must never
-            # be passed: faster-whisper stores it on the shared feature
-            # extractor, which would change it for every other session.
-            segments, _info = self._model.transcribe(
-                audio,
-                language=language,
-                hotwords=hotwords,
-                initial_prompt=initial_prompt,
-            )
-            # ``segments`` is lazy and decodes while it is consumed, so consume
-            # it here on the worker thread, not on the event loop.
+            segments = self._decode(audio, language, hotwords, initial_prompt, context)
             result = WhisperTranscription(
-                segments=list(segments),
+                segments=segments,
                 queue_wait_secs=started_at - submitted_at,
                 inference_secs=time.perf_counter() - started_at,
+                batch_wait_secs=context.batch_wait_secs,
+                batch_size=context.batch_size,
             )
             succeeded = True
             return result
@@ -316,5 +406,16 @@ class SharedWhisperEngine:
                 self._running -= 1
                 if succeeded:
                     self._completed += 1
+                elif context.cancelled.is_set():
+                    self._cancelled += 1
                 else:
                     self._failed += 1
+
+
+async def load_whisper_engine(config: WhisperEngineConfig) -> SharedWhisperEngine:
+    """The process-wide engine for ``config``: batched when ``max_batch_size > 1``."""
+    if config.max_batch_size > 1:
+        from .batching import BatchedWhisperEngine
+
+        return await BatchedWhisperEngine.load(config)
+    return await SharedWhisperEngine.load(config)

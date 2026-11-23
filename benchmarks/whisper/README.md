@@ -110,6 +110,8 @@ uv run --group bench python -m benchmarks.whisper.matrix
 | `batched-beam5-b4` | Batched engine, batches of up to 4, beam 5 (same quality as today) |
 | `batched-greedy-b16` | Batched engine, batches of up to 16, greedy decoding |
 
+Results of the run on an RTX 3070 Laptop GPU are in [RESULTS.md](RESULTS.md).
+
 Results go to `results/matrix-<time>/`: a report and server log per variant
 and `summary.json` with each variant's capacity (the largest passing step).
 

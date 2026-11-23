@@ -1,6 +1,6 @@
 import struct
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 import numpy as np
 from pipecat.frames.frames import ErrorFrame, MetricsFrame, TTSAudioRawFrame
@@ -192,13 +192,19 @@ class Wav2ArkitBlendshapeProcessorTests(unittest.IsolatedAsyncioTestCase):
         model = Mock()
         model.predict.return_value = [[0.1, 0.2]]
         processor = Wav2ArkitBlendshapeProcessor(model=model)
-        processor._enable_metrics = True
         processor.push_frame = AsyncMock()
 
-        await processor.process_frame(
-            _audio_frame([0]),
-            FrameDirection.DOWNSTREAM,
-        )
+        # Pipecat enables metrics from the pipeline setup; emulate that here.
+        with patch.object(
+            Wav2ArkitBlendshapeProcessor,
+            "metrics_enabled",
+            new_callable=PropertyMock,
+            return_value=True,
+        ):
+            await processor.process_frame(
+                _audio_frame([0]),
+                FrameDirection.DOWNSTREAM,
+            )
 
         metrics_frame = processor.push_frame.await_args_list[-1].args[0]
         self.assertIsInstance(metrics_frame, MetricsFrame)

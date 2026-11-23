@@ -29,7 +29,7 @@ from benchmarks.whisper.audio import (
     load_clip,
     split_chunks,
 )
-from benchmarks.whisper.matrix import capacity
+from benchmarks.whisper.matrix import agreement, capacity, noise_floor
 from benchmarks.whisper.matrix import parse_args as matrix_args
 from benchmarks.whisper.client import Options, load_baseline, parse_args, run_session
 from benchmarks.whisper.report import (
@@ -278,6 +278,42 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(result["first_failing_sessions"], 12)
         self.assertEqual(result["latency_p95_at_max"], 0.8)
         self.assertEqual(result["gpu_memory_mb_at_max"], 2008.0)
+
+    def test_transcripts_are_compared_on_identical_audio(self):
+        def report(transcripts):
+            # transcripts: {(step, session): [file texts in playlist order]}
+            return {
+                "steps": [
+                    {
+                        "sessions_requested": step,
+                        "sessions": [
+                            {
+                                "session": session,
+                                "state": "done",
+                                "clip_transcripts": [
+                                    {"clip": f"f{i}", "transcript": t} for i, t in enumerate(texts)
+                                ],
+                            }
+                            for (st, session), texts in transcripts.items()
+                            if st == step
+                        ],
+                    }
+                    for step in sorted({st for st, _ in transcripts})
+                ]
+            }
+
+        reference = report(
+            {(1, "s001"): ["a b c d", "e f"], (4, "s001"): ["a b c d", "e g"], (4, "s002"): ["x y"]}
+        )
+        variant = report({(1, "s001"): ["a b c d", "e f"], (4, "s001"): ["a b X d", "e g"]})
+
+        self.assertEqual(
+            agreement(reference, variant),
+            {"files_compared": 4, "files_differing": 1, "mean_wer": 0.0625, "max_wer": 0.25},
+        )
+        # s001 file 1 changed between steps 1 and 4 of the reference itself.
+        floor = noise_floor(reference)
+        self.assertEqual((floor["files_compared"], floor["files_differing"]), (2, 1))
 
     def test_variants_are_validated(self):
         with patch("sys.stderr"), self.assertRaises(SystemExit):

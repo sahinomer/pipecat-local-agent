@@ -100,7 +100,7 @@ between steps and variants. Print the plan and a time estimate first:
 
 ```sh
 uv run --group bench python -m benchmarks.whisper.matrix --dry-run
-uv run --group bench python -m benchmarks.whisper.matrix     --baseline-from benchmarks/whisper/results/<baseline report>.json
+uv run --group bench python -m benchmarks.whisper.matrix
 ```
 
 | Variant | Server |
@@ -112,6 +112,17 @@ uv run --group bench python -m benchmarks.whisper.matrix     --baseline-from ben
 
 Results go to `results/matrix-<time>/`: a report and server log per variant
 and `summary.json` with each variant's capacity (the largest passing step).
+
+`summary.json` also compares each variant's transcripts with
+`pipecat-per-session` on identical audio: a session's files depend only on
+its index, so the same step, session and file means the same audio. The
+reference compared with itself across steps gives the noise floor, the
+difference between runs with nothing changed. Recompute it for an earlier run
+with `--summarize results/matrix-<time>`.
+
+Drift against a solo `--baseline` is only meaningful without `--duration`:
+streaming files back to back changes the audio around segment boundaries, so
+even an unchanged engine drifts from a baseline streamed file by file.
 
 ## What is measured
 

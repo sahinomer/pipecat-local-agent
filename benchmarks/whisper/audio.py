@@ -9,6 +9,7 @@ import soundfile
 from scipy.signal import resample_poly
 
 from .protocol import SAMPLE_RATE
+from .report import PlaylistItem
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".ogg", ".mp3", ".opus")
 
@@ -72,6 +73,62 @@ def load_clip(path: Path) -> AudioClip:
     if reference_path.is_file():
         reference = reference_path.read_text(encoding="utf-8-sig").strip() or None
     return AudioClip(name=path.name, path=path, pcm=pcm, reference=reference)
+
+
+def plan_playlist(
+    durations: list[float],
+    start: int,
+    *,
+    duration_secs: float,
+    gap_secs: float,
+) -> list[tuple[int, float]]:
+    """Choose files for one session: ``(index, offset_secs)`` pairs.
+
+    Starting at ``start`` and going round the list once, each file is added
+    whole if it still fits in ``duration_secs``, with ``gap_secs`` of silence
+    between files. The first file is always added, even when it alone is
+    longer, so every file is used by some session.
+    """
+    plan: list[tuple[int, float]] = []
+    total = 0.0
+    for k in range(len(durations)):
+        index = (start + k) % len(durations)
+        if plan:
+            if total + gap_secs + durations[index] > duration_secs:
+                continue
+            total += gap_secs
+        plan.append((index, total))
+        total += durations[index]
+    return plan
+
+
+def build_playlist(
+    clips: list[AudioClip],
+    start: int,
+    *,
+    duration_secs: float,
+    gap_secs: float,
+) -> tuple[bytes, list[PlaylistItem]]:
+    """Stream several files back to back for about ``duration_secs``.
+
+    See :func:`plan_playlist` for how files are chosen.
+    """
+    plan = plan_playlist(
+        [clip.duration_secs for clip in clips],
+        start,
+        duration_secs=duration_secs,
+        gap_secs=gap_secs,
+    )
+    gap = bytes(int(SAMPLE_RATE * gap_secs) * 2)
+    parts: list[bytes] = []
+    items: list[PlaylistItem] = []
+    for index, offset in plan:
+        if items:
+            parts.append(gap)
+        clip = clips[index]
+        items.append(PlaylistItem(clip.name, offset, clip.duration_secs))
+        parts.append(clip.pcm)
+    return b"".join(parts), items
 
 
 def split_chunks(pcm: bytes, *, chunk_ms: int) -> list[bytes]:

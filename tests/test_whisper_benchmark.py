@@ -6,6 +6,7 @@ client session code over a real WebSocket.
 """
 
 import asyncio
+import json
 import socket
 import tempfile
 import unittest
@@ -21,9 +22,18 @@ from pipecat.frames.frames import InputAudioRawFrame, OutputTransportMessageUrge
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 
 from benchmarks.whisper import protocol, server
-from benchmarks.whisper.audio import AudioClip, find_audio_files, load_clip, split_chunks
+from benchmarks.whisper.audio import (
+    AudioClip,
+    build_playlist,
+    find_audio_files,
+    load_clip,
+    split_chunks,
+)
+from benchmarks.whisper.matrix import capacity
+from benchmarks.whisper.matrix import parse_args as matrix_args
 from benchmarks.whisper.client import Options, load_baseline, parse_args, run_session
 from benchmarks.whisper.report import (
+    PlaylistItem,
     SegmentResult,
     SessionResult,
     Thresholds,
@@ -89,6 +99,64 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(len(chunks[0]), 640)
         self.assertEqual(sum(len(c) for c in chunks), 16000 * 2 + 100)
+
+
+def _clip(name: str, seconds: float) -> AudioClip:
+    return AudioClip(name=name, path=Path(name), pcm=bytes(int(16000 * seconds) * 2))
+
+
+class PlaylistTests(unittest.TestCase):
+    def test_files_fill_the_duration_whole_and_in_rotation(self):
+        clips = [_clip("a", 30), _clip("b", 50), _clip("c", 20), _clip("d", 40)]
+
+        pcm, items = build_playlist(clips, 1, duration_secs=100, gap_secs=1)
+
+        # b (50) + c (20) fit, d (40) would overflow, a (30) does not fit either.
+        self.assertEqual([i.clip for i in items], ["b", "c"])
+        self.assertEqual([i.offset_secs for i in items], [0.0, 51.0])
+        self.assertEqual(len(pcm), int(16000 * 71) * 2)
+
+    def test_a_first_file_longer_than_the_duration_still_plays(self):
+        clips = [_clip("long", 180), _clip("short", 10)]
+
+        _pcm, items = build_playlist(clips, 0, duration_secs=120, gap_secs=1)
+
+        self.assertEqual([i.clip for i in items], ["long"])
+
+    def test_segments_are_matched_to_the_file_they_started_in(self):
+        session = SessionResult(
+            session="s1",
+            clip="a +1",
+            playlist=[PlaylistItem("a", 0.0, 10.0), PlaylistItem("b", 11.0, 5.0)],
+            segments=[
+                SegmentResult(1, "first", 3.0, 0.1, 0.1, 0.0, 0.1, None, start_audio_secs=0.4),
+                SegmentResult(2, "second", 3.0, 0.1, 0.1, 0.0, 0.1, None, start_audio_secs=6.0),
+                # Estimated slightly before b's offset, but inside the gap.
+                SegmentResult(3, "third", 3.0, 0.1, 0.1, 0.0, 0.1, None, start_audio_secs=10.7),
+            ],
+        )
+
+        self.assertEqual(session.clip_transcripts(), [("a", "first second"), ("b", "third")])
+
+    def test_drift_and_reference_wer_are_per_file(self):
+        session = SessionResult(
+            session="s1",
+            clip="a +1",
+            state="done",
+            playlist=[PlaylistItem("a", 0.0, 10.0), PlaylistItem("b", 11.0, 5.0)],
+            segments=[
+                SegmentResult(1, "hello there", 3.0, 0.2, 0.1, 0.0, 0.1, None, start_audio_secs=1.0),
+                SegmentResult(2, "wrong words", 3.0, 0.2, 0.1, 0.0, 0.1, None, start_audio_secs=12.0),
+            ],
+        )
+
+        summary = summarize_step(
+            [session], [], baseline={"a": "hello there", "b": "good bye"}, references={"a": "hello there"}
+        )
+
+        self.assertEqual(summary["drift_wer_max"], 1.0)
+        self.assertEqual(summary["drift_wer_mean"], 0.5)
+        self.assertEqual(summary["reference_wer_mean"], 0.0)
 
 
 def _segment(latency: float, *, text="hi", error=None, queue=0.0, inference=0.1):
@@ -182,12 +250,50 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(summary["peak_models_loaded"])
 
 
+class MatrixTests(unittest.TestCase):
+    def test_capacity_is_the_largest_passing_step(self):
+        def step(n, passed, p95):
+            return {
+                "sessions_requested": n,
+                "summary": {
+                    "passed": passed,
+                    "reasons": [] if passed else [f"p95 latency {p95:.2f}s > 1.00s"],
+                    "latency_p95": p95,
+                    "peak_gpu_memory_mb": 2000.0 + n,
+                    "reference_wer_mean": 0.15,
+                    "drift_wer_max": 0.0,
+                    "batch_size_mean": 1.5,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "variant.json"
+            report.write_text(
+                json.dumps({"steps": [step(1, True, 0.3), step(8, True, 0.8), step(12, False, 1.4)]}),
+                encoding="utf-8",
+            )
+            result = capacity(report)
+
+        self.assertEqual(result["max_sessions_passing"], 8)
+        self.assertEqual(result["first_failing_sessions"], 12)
+        self.assertEqual(result["latency_p95_at_max"], 0.8)
+        self.assertEqual(result["gpu_memory_mb_at_max"], 2008.0)
+
+    def test_variants_are_validated(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            matrix_args(["--variants", "nope"])
+        args = matrix_args(["--variants", "shared-w1,batched-beam5-b4", "--ramp", "1,4"])
+        self.assertEqual((args.variant_names, args.steps), (["shared-w1", "batched-beam5-b4"], [1, 4]))
+
+
 class ClientOptionTests(unittest.TestCase):
     def test_baseline_options_are_validated(self):
         for argv, message in (
             (["a.wav", "--baseline-only"], "requires --baseline"),
             (["a.wav", "--baseline", "--baseline-only", "--ramp", "1,2"], "cannot be combined"),
             (["a.wav", "--baseline", "--baseline-speed", "0"], "must be positive"),
+            (["a.wav", "--max-files", "0"], "at least 1"),
+            (["a.wav", "--duration", "0"], "must be positive"),
         ):
             with self.subTest(argv=argv):
                 with patch("sys.stderr"), self.assertRaises(SystemExit):
@@ -290,7 +396,7 @@ class BenchmarkServerEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
             async with aiohttp.ClientSession() as http:
                 await asyncio.gather(
-                    *(run_session(http, opts, c, s) for c, s in zip(clips, sessions))
+                    *(run_session(http, opts, c.pcm, s) for c, s in zip(clips, sessions))
                 )
                 async with http.get(opts.stats_url) as response:
                     stats = await response.json()
@@ -331,7 +437,7 @@ class BenchmarkServerEndToEndTests(unittest.IsolatedAsyncioTestCase):
             sessions = [SessionResult(session=f"s{i}", clip=c.name) for i, c in enumerate(clips)]
             async with aiohttp.ClientSession() as http:
                 await asyncio.gather(
-                    *(run_session(http, opts, c, s) for c, s in zip(clips, sessions))
+                    *(run_session(http, opts, c.pcm, s) for c, s in zip(clips, sessions))
                 )
                 async with http.get(opts.stats_url) as response:
                     stats = await response.json()
@@ -346,6 +452,32 @@ class BenchmarkServerEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["engine"]["max_batch_size"], 4)
         self.assertGreater(max(s.segments[0].batch_size for s in sessions), 1)
 
+    async def test_a_session_streaming_several_files_reports_each_files_transcript(self):
+        engine = SharedWhisperEngine(FakeWhisperModel(), model_name="fake-model")
+        self.addCleanup(engine.close)
+        with (
+            patch.object(server, "load_whisper_engine", AsyncMock(return_value=engine)),
+            patch.object(server, "SileroVADAnalyzer", EnergyVADAnalyzer),
+        ):
+            opts = await self._serve("--engine", "shared")
+            clips = [
+                AudioClip(name="a.wav", path=Path("a.wav"), pcm=_utterances(2001, 2002)),
+                AudioClip(name="b.wav", path=Path("b.wav"), pcm=_utterances(3001)),
+            ]
+            pcm, playlist = build_playlist(clips, 0, duration_secs=60, gap_secs=1.0)
+            session = SessionResult(session="s1", clip="a.wav +1", playlist=playlist)
+            async with aiohttp.ClientSession() as http:
+                await run_session(http, opts, pcm, session)
+
+        self.assertEqual(session.state, "done", session.failure)
+        self.assertEqual(
+            session.clip_transcripts(),
+            [("a.wav", "en:2001 en:2002"), ("b.wav", "en:3001")],
+        )
+        for segment in session.segments:
+            self.assertIsNotNone(segment.start_audio_secs)
+            self.assertGreater(segment.end_audio_secs, segment.start_audio_secs)
+
     async def test_session_setup_failure_reaches_the_client(self):
         with patch.object(
             server,
@@ -357,7 +489,7 @@ class BenchmarkServerEndToEndTests(unittest.IsolatedAsyncioTestCase):
             clip = AudioClip(name="c.wav", path=Path("c.wav"), pcm=_utterances(5))
 
             async with aiohttp.ClientSession() as http:
-                await run_session(http, opts, clip, session)
+                await run_session(http, opts, clip.pcm, session)
                 async with http.get(opts.stats_url) as response:
                     stats = await response.json()
 

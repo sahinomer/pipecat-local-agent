@@ -94,6 +94,7 @@ class SegmentReportingMixin:
         self._bench_state = bench_state
         self._bench_stopped_at: dict[int, float] = {}
         self._bench_audio_bytes = 0
+        self._bench_positions: dict[int, list[float | None]] = {}
         self._bench_flush_bytes: int | None = None
         self._bench_audio_done = False
         super().__init__(**kwargs)
@@ -128,8 +129,20 @@ class SegmentReportingMixin:
             }
         )
 
+    def _bench_position(self, vad_delay_secs: float) -> float:
+        """Where in the session's stream the speech change happened.
+
+        VAD confirms a start or stop ``vad_delay_secs`` after it happens, and
+        the STT stage has received the stream up to the confirming frame.
+        """
+        return max(0.0, self._bench_audio_bytes / BYTES_PER_SECOND - vad_delay_secs)
+
     async def _handle_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
         await super()._handle_user_started_speaking(frame)
+        self._bench_positions[self._segment_count] = [
+            self._bench_position(frame.start_secs),
+            None,
+        ]
         await self._send_bench_message(
             {"type": protocol.VAD, "event": "started", "segment": self._segment_count}
         )
@@ -137,6 +150,9 @@ class SegmentReportingMixin:
     async def _handle_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         segment = self._segment_count
         self._bench_stopped_at[segment] = time.perf_counter()
+        self._bench_positions.setdefault(segment, [None, None])[1] = self._bench_position(
+            frame.stop_secs
+        )
         await super()._handle_user_stopped_speaking(frame)
         await self._send_bench_message(
             {"type": protocol.VAD, "event": "stopped", "segment": segment}
@@ -145,6 +161,7 @@ class SegmentReportingMixin:
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         segment = self._transcribing_segment
         stopped_at = self._bench_stopped_at.pop(segment, None)
+        start_position, end_position = self._bench_positions.pop(segment, [None, None])
         started_at = time.perf_counter()
         texts: list[str] = []
         error: str | None = None
@@ -186,6 +203,8 @@ class SegmentReportingMixin:
                 "inference_secs": inference_secs,
                 "batch_wait_secs": batch_wait_secs,
                 "batch_size": batch_size,
+                "start_audio_secs": start_position,
+                "end_audio_secs": end_position,
                 "error": error,
             }
         )

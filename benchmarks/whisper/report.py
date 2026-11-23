@@ -20,6 +20,8 @@ class SegmentResult:
     error: str | None
     batch_wait_secs: float | None = None
     batch_size: int | None = None
+    start_audio_secs: float | None = None
+    end_audio_secs: float | None = None
 
     @classmethod
     def from_message(cls, message: dict[str, Any]) -> "SegmentResult":
@@ -34,7 +36,30 @@ class SegmentResult:
             error=message.get("error"),
             batch_wait_secs=message.get("batch_wait_secs"),
             batch_size=message.get("batch_size"),
+            start_audio_secs=message.get("start_audio_secs"),
+            end_audio_secs=message.get("end_audio_secs"),
         )
+
+
+@dataclass(frozen=True)
+class PlaylistItem:
+    """One file inside a session's audio stream.
+
+    Parameters:
+        clip: File name.
+        offset_secs: Where the file starts in the session's stream.
+        duration_secs: The file's length.
+    """
+
+    clip: str
+    offset_secs: float
+    duration_secs: float
+
+
+# A segment whose speech starts this soon before a file's offset still
+# belongs to that file: VAD positions are estimates, and files are separated
+# by a silence gap longer than this.
+_CLIP_BOUNDARY_SLACK_SECS = 0.5
 
 
 @dataclass
@@ -51,10 +76,32 @@ class SessionResult:
     vad_stopped: int = 0
     segments: list[SegmentResult] = field(default_factory=list)
     failure: str | None = None
+    playlist: list[PlaylistItem] = field(default_factory=list)
 
     @property
     def transcript(self) -> str:
         return " ".join(s.text for s in sorted(self.segments, key=lambda s: s.segment) if s.text)
+
+    def clip_transcripts(self) -> list[tuple[str, str]]:
+        """The transcript of each file the session streamed, in order.
+
+        Segments are matched to files by where their speech started in the
+        stream. A session that streamed one file gets its whole transcript.
+        """
+        items = self.playlist or [PlaylistItem(self.clip, 0.0, 0.0)]
+        if len(items) == 1:
+            return [(items[0].clip, self.transcript)]
+        texts: list[list[str]] = [[] for _ in items]
+        for segment in sorted(self.segments, key=lambda s: s.segment):
+            if not segment.text or segment.start_audio_secs is None:
+                continue
+            position = segment.start_audio_secs + _CLIP_BOUNDARY_SLACK_SECS
+            index = max(
+                (i for i, item in enumerate(items) if item.offset_secs <= position),
+                default=0,
+            )
+            texts[index].append(segment.text)
+        return [(item.clip, " ".join(t)) for item, t in zip(items, texts)]
 
     @property
     def segment_errors(self) -> list[str]:
@@ -63,6 +110,9 @@ class SessionResult:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["transcript"] = self.transcript
+        data["clip_transcripts"] = [
+            {"clip": clip, "transcript": text} for clip, text in self.clip_transcripts()
+        ]
         return data
 
 
@@ -70,7 +120,7 @@ class SessionResult:
 class Thresholds:
     """When a load step counts as failed."""
 
-    max_p95_latency_secs: float = 1.5
+    max_p95_latency_secs: float = 1.0
     max_wer_drift: float | None = None
 
 
@@ -140,6 +190,17 @@ def gpu_peak(samples: list[dict[str, Any]], key: str) -> float | None:
     )
 
 
+def _busy_clock_min(samples: list[dict[str, Any]]) -> float | None:
+    """The lowest SM clock seen while a GPU was busy; a drop means throttling."""
+    clocks = [
+        gpu["sm_clock_mhz"]
+        for s in samples
+        for gpu in s.get("system", {}).get("gpus", [])
+        if gpu.get("sm_clock_mhz") and gpu.get("utilization_percent", 0) >= 50
+    ]
+    return float(min(clocks)) if clocks else None
+
+
 def _engine_delta(samples: list[dict[str, Any]], key: str) -> float | None:
     values = [s["engine"][key] for s in samples if key in s.get("engine", {})]
     return values[-1] - values[0] if len(values) >= 2 else None
@@ -169,15 +230,16 @@ def summarize_step(
         if seg.inference_secs is not None and seg.audio_secs > 0
     ]
 
+    clip_texts = [pair for s in sessions if s.state == "done" for pair in s.clip_transcripts()]
     drift = [
-        word_error_rate(baseline[s.clip], s.transcript)
-        for s in sessions
-        if baseline and s.clip in baseline and s.state == "done"
+        word_error_rate(baseline[clip], text)
+        for clip, text in clip_texts
+        if baseline and clip in baseline
     ]
     reference_wer = [
-        word_error_rate(references[s.clip], s.transcript)
-        for s in sessions
-        if references and s.clip in references and s.state == "done"
+        word_error_rate(references[clip], text)
+        for clip, text in clip_texts
+        if references and clip in references
     ]
 
     failed_sessions = [s for s in sessions if s.failure]
@@ -232,6 +294,9 @@ def summarize_step(
         ),
         "peak_gpu_percent": gpu_peak(stats_samples, "utilization_percent"),
         "peak_gpu_memory_mb": gpu_peak(stats_samples, "memory_used_mb"),
+        "peak_gpu_temp_c": gpu_peak(stats_samples, "temperature_c"),
+        "peak_gpu_power_w": gpu_peak(stats_samples, "power_w"),
+        "gpu_sm_clock_min_busy_mhz": _busy_clock_min(stats_samples),
         "peak_loop_lag_ms": _peak(stats_samples, lambda s: s["loop_lag_ms"]),
         "peak_client_cpu_percent": client_cpu_peak,
         "passed": not reasons,

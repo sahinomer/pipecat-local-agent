@@ -24,8 +24,10 @@ Server -> client messages:
     One VAD segment was transcribed. Sent for every stopped segment, also
     when the transcript is empty or transcription failed. ``{segment, text,
     audio_secs, latency_secs, stt_secs, queue_wait_secs, inference_secs,
-    batch_wait_secs, batch_size, error}``. The batch fields are set only by
-    the batched engine. Timings are measured on the server; ``latency_secs`` runs from
+    batch_wait_secs, batch_size, start_audio_secs, end_audio_secs, error}``.
+    The batch fields are set only by the batched engine. ``start_audio_secs``
+    and ``end_audio_secs`` estimate where the speech starts and ends in the
+    session's audio stream. Timings are measured on the server; ``latency_secs`` runs from
     the VAD stop decision to the moment the report is sent.
 ``bench.audio_done``
     The STT stage has received all audio named by ``bench.flush``. VAD runs

@@ -93,14 +93,23 @@ class SystemSampler:
                 gpu_memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
             except pynvml.NVMLError:
                 continue
-            sample["gpus"].append(
-                {
-                    "index": index,
-                    "utilization_percent": float(utilization.gpu),
-                    "memory_used_mb": gpu_memory.used / 2**20,
-                    "memory_total_mb": gpu_memory.total / 2**20,
-                }
-            )
+            gpu = {
+                "index": index,
+                "utilization_percent": float(utilization.gpu),
+                "memory_used_mb": gpu_memory.used / 2**20,
+                "memory_total_mb": gpu_memory.total / 2**20,
+            }
+            # Laptop GPUs throttle when hot; clocks and temperature show it.
+            for key, read in (
+                ("temperature_c", lambda: pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)),
+                ("sm_clock_mhz", lambda: pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)),
+                ("power_w", lambda: pynvml.nvmlDeviceGetPowerUsage(handle) / 1000),
+            ):
+                try:
+                    gpu[key] = float(read())
+                except pynvml.NVMLError:
+                    pass
+            sample["gpus"].append(gpu)
         return sample
 
 

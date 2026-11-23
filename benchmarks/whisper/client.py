@@ -31,8 +31,15 @@ import aiohttp  # noqa: E402
 import psutil  # noqa: E402
 
 from . import protocol  # noqa: E402
-from .audio import AudioClip, find_audio_files, load_clip, split_chunks  # noqa: E402
+from .audio import (  # noqa: E402
+    AudioClip,
+    build_playlist,
+    find_audio_files,
+    load_clip,
+    split_chunks,
+)
 from .report import (  # noqa: E402
+    PlaylistItem,
     SegmentResult,
     SessionResult,
     Thresholds,
@@ -94,6 +101,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="run the --baseline and stop, without load steps",
     )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        help="use only the first N files, in sorted order",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        help=(
+            "seconds each session streams: files are played back to back, so every "
+            "session talks for about this long (default: one file per session)"
+        ),
+    )
+    parser.add_argument(
+        "--clip-gap",
+        type=float,
+        default=1.0,
+        help="seconds of silence between files in a --duration session",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=0.0,
+        help="seconds to idle between steps, so a laptop GPU starts each step cool",
+    )
     parser.add_argument("--speed", type=float, default=1.0, help="1.0 streams in real time")
     parser.add_argument("--stagger", type=float, default=0.0, help="seconds between session starts")
     parser.add_argument("--chunk-ms", type=int, default=20)
@@ -116,7 +148,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=60.0,
         help="seconds to wait for outstanding segments after the audio ends",
     )
-    parser.add_argument("--max-p95-latency", type=float, default=1.5)
+    parser.add_argument(
+        "--max-p95-latency",
+        type=float,
+        default=1.0,
+        help="fail a step when p95 end-of-speech-to-transcript latency exceeds this",
+    )
     parser.add_argument(
         "--max-drift",
         type=float,
@@ -143,6 +180,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("session counts must be at least 1")
     if args.speed <= 0:
         parser.error("--speed must be positive")
+    if args.max_files is not None and args.max_files < 1:
+        parser.error("--max-files must be at least 1")
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration must be positive")
     if args.baseline_speed is not None and args.baseline_speed <= 0:
         parser.error("--baseline-speed must be positive")
     if args.baseline_only and not args.baseline:
@@ -178,10 +219,10 @@ async def _wait_for(predicate, *, timeout: float, receiver: asyncio.Task, what: 
 async def run_session(
     http: aiohttp.ClientSession,
     opts: Options,
-    clip: AudioClip,
+    pcm: bytes,
     result: SessionResult,
 ) -> None:
-    """Stream ``clip`` over one connection and record what the server reports."""
+    """Stream ``pcm`` over one connection and record what the server reports."""
     loop = asyncio.get_running_loop()
     result.state = "connecting"
     try:
@@ -238,7 +279,7 @@ async def run_session(
 
         result.state = "streaming"
         chunk_secs = opts.chunk_ms / 1000
-        chunks = split_chunks(clip.pcm, chunk_ms=opts.chunk_ms)
+        chunks = split_chunks(pcm, chunk_ms=opts.chunk_ms)
         silence = bytes(protocol.SAMPLE_RATE * 2 * opts.chunk_ms // 1000)
         chunks += [silence] * round(opts.tail_silence_secs / chunk_secs)
         sent_bytes = 0
@@ -332,17 +373,28 @@ async def run_step(
     poller: StatsPoller,
     view: "View",
     label: str,
+    *,
+    duration_secs: float | None = None,
+    gap_secs: float = 1.0,
 ) -> list[SessionResult]:
-    sessions = [
-        SessionResult(session=f"s{i + 1:03d}", clip=clips[i % len(clips)].name)
-        for i in range(count)
-    ]
-    by_name = {clip.name: clip for clip in clips}
+    sessions: list[SessionResult] = []
+    audio: list[bytes] = []
+    for i in range(count):
+        if duration_secs:
+            pcm, playlist = build_playlist(
+                clips, i % len(clips), duration_secs=duration_secs, gap_secs=gap_secs
+            )
+        else:
+            clip = clips[i % len(clips)]
+            pcm, playlist = clip.pcm, [PlaylistItem(clip.name, 0.0, clip.duration_secs)]
+        label_clip = playlist[0].clip + (f" +{len(playlist) - 1}" if len(playlist) > 1 else "")
+        sessions.append(SessionResult(session=f"s{i + 1:03d}", clip=label_clip, playlist=playlist))
+        audio.append(pcm)
 
     async def start(index: int, result: SessionResult):
         if opts.stagger_secs:
             await asyncio.sleep(index * opts.stagger_secs)
-        await run_session(http, opts, by_name[result.clip], result)
+        await run_session(http, opts, audio[index], result)
 
     poller.reset()
     view.begin_step(label, sessions)
@@ -391,6 +443,8 @@ def _stats_line(sample: dict[str, Any] | None, poller: StatsPoller) -> str:
             parts.append(
                 f"GPU{gpu['index']} {gpu['utilization_percent']:.0f}% "
                 f"{gpu['memory_used_mb'] / 1024:.1f}/{gpu['memory_total_mb'] / 1024:.1f} GB"
+                + (f" {gpu['temperature_c']:.0f}C" if "temperature_c" in gpu else "")
+                + (f" {gpu['sm_clock_mhz']:.0f}MHz" if "sm_clock_mhz" in gpu else "")
             )
     parts.append(f"loop lag {sample['loop_lag_ms']:.0f} ms")
     parts.append(f"client CPU {poller.client_cpu_percent:.0f}%")
@@ -463,10 +517,20 @@ class View:
             )
 
 
-def _drift(session: SessionResult, baseline: dict[str, str] | None) -> str:
-    if not baseline or session.clip not in baseline or session.state != "done":
+def _mean_wer(session: SessionResult, expected: dict[str, str] | None) -> str:
+    """Mean WER of the session's files against ``expected`` transcripts."""
+    if not expected or session.state != "done":
         return "-"
-    return f"{word_error_rate(baseline[session.clip], session.transcript):.2f}"
+    rates = [
+        word_error_rate(expected[clip], text)
+        for clip, text in session.clip_transcripts()
+        if clip in expected
+    ]
+    return f"{sum(rates) / len(rates):.2f}" if rates else "-"
+
+
+def _drift(session: SessionResult, baseline: dict[str, str] | None) -> str:
+    return _mean_wer(session, baseline)
 
 
 def make_view(poller: StatsPoller, plain: bool) -> View:
@@ -564,9 +628,7 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
             table.add_column("ref WER", justify="right")
             table.add_column("transcript", ratio=1)
             for s in sessions:
-                ref = "-"
-                if references and s.clip in references and s.state == "done":
-                    ref = f"{word_error_rate(references[s.clip], s.transcript):.2f}"
+                ref = _mean_wer(s, references)
                 body = s.transcript or "[dim](no transcript)[/]"
                 if s.failure:
                     body = f"[bold red]{s.failure}[/]\n{s.transcript}"
@@ -587,7 +649,8 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
             table.add_column("step", no_wrap=True, min_width=8)
             for name in (
                 "sess", "segs", "err", "lat50", "lat95", "latmax", "q95",
-                "inf50", "queued", "batch", "gpu%", "gpuMB", "cpu%", "lag ms", "drift", "refWER",
+                "inf50", "queued", "batch", "gpu%", "gpuMB", "gpuC", "cpu%", "lag ms", "drift",
+                "refWER",
             ):
                 table.add_column(name, justify="right", no_wrap=True)
             for label, s in rows:
@@ -606,6 +669,7 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
                     _fmt(s.get("batch_size_mean"), "", 1),
                     _fmt(s["peak_gpu_percent"], "", 0),
                     _fmt(s["peak_gpu_memory_mb"], "", 0),
+                    _fmt(s.get("peak_gpu_temp_c"), "", 0),
                     _fmt(s["peak_cpu_percent"], "", 0),
                     _fmt(s["peak_loop_lag_ms"], "", 0),
                     _fmt(s["drift_wer_max"]),
@@ -636,6 +700,8 @@ def _report_path(args: argparse.Namespace, server: dict[str, Any]) -> Path:
 
 async def run(args: argparse.Namespace) -> int:
     paths = find_audio_files(args.inputs)
+    if args.max_files:
+        paths = paths[: args.max_files]
     clips = [load_clip(path) for path in paths]
     names = [clip.name for clip in clips]
     if len(set(names)) != len(names):
@@ -700,6 +766,10 @@ async def run(args: argparse.Namespace) -> int:
                 "stagger": args.stagger,
                 "chunk_ms": args.chunk_ms,
                 "tail_silence": args.tail_silence,
+                "max_files": args.max_files,
+                "duration": args.duration,
+                "clip_gap": args.clip_gap,
+                "cooldown": args.cooldown,
                 "thresholds": vars(thresholds),
             },
             "clips": [
@@ -767,9 +837,22 @@ async def run(args: argparse.Namespace) -> int:
                 if not baseline_summary["passed"]:
                     exit_code = 1
 
-            for count in steps:
+            for step_index, count in enumerate(steps):
+                if args.cooldown and (step_index or args.baseline):
+                    view.print(f"cooling down for {args.cooldown:g}s")
+                    await asyncio.sleep(args.cooldown)
                 label = f"step {count}"
-                sessions = await run_step(http, opts, clips, count, poller, view, label)
+                sessions = await run_step(
+                    http,
+                    opts,
+                    clips,
+                    count,
+                    poller,
+                    view,
+                    label,
+                    duration_secs=args.duration,
+                    gap_secs=args.clip_gap,
+                )
                 summary = summarize_step(
                     sessions,
                     poller.samples,

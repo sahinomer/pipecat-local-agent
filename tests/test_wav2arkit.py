@@ -8,7 +8,7 @@ from pipecat.metrics.metrics import ProcessingMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
 
-from processor.wav2arkit_blendshape import (
+from services.wav2arkit import (
     Wav2ArkitBlendshapeModel,
     Wav2ArkitBlendshapeProcessor,
 )
@@ -83,7 +83,7 @@ class Wav2ArkitAudioInputTests(unittest.TestCase):
             [[(-32768 + 32767) / 2 / 32768, 0.25]],
         )
 
-    @patch("processor.wav2arkit_blendshape.resample_poly")
+    @patch("services.wav2arkit.blendshapes.resample_poly")
     def test_audio_is_resampled_to_16khz(self, resample_poly):
         resample_poly.return_value = np.array([0.25, 0.5], dtype=np.float64)
         frame = _audio_frame([0, 16384], sample_rate=24000)

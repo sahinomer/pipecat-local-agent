@@ -37,8 +37,11 @@ from observability import (
     PrometheusMetricsObserver,
 )
 from prompts import load_prompt
-from services import ChatterboxTTSService, VLLMService
-from processor import Wav2ArkitBlendshapeProcessor
+from services import (
+    ChatterboxTTSService,
+    VLLMService,
+    Wav2ArkitBlendshapeProcessor,
+)
 
 SYSTEM_PROMPT = load_prompt(
     "system.md",

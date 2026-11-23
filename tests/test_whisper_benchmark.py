@@ -22,7 +22,7 @@ from pipecat.serializers.protobuf import ProtobufFrameSerializer
 
 from benchmarks.whisper import protocol, server
 from benchmarks.whisper.audio import AudioClip, find_audio_files, load_clip, split_chunks
-from benchmarks.whisper.client import Options, run_session
+from benchmarks.whisper.client import Options, load_baseline, parse_args, run_session
 from benchmarks.whisper.report import (
     SegmentResult,
     SessionResult,
@@ -180,6 +180,33 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary["peak_gpu_memory_mb"], 2000.0)
         self.assertEqual(summary["peak_loop_lag_ms"], 30.0)
         self.assertIsNone(summary["peak_models_loaded"])
+
+
+class ClientOptionTests(unittest.TestCase):
+    def test_baseline_options_are_validated(self):
+        for argv, message in (
+            (["a.wav", "--baseline-only"], "requires --baseline"),
+            (["a.wav", "--baseline", "--baseline-only", "--ramp", "1,2"], "cannot be combined"),
+            (["a.wav", "--baseline", "--baseline-speed", "0"], "must be positive"),
+        ):
+            with self.subTest(argv=argv):
+                with patch("sys.stderr"), self.assertRaises(SystemExit):
+                    parse_args(argv)
+        args = parse_args(["a.wav", "--baseline", "--baseline-speed", "4", "--ramp", "1,8"])
+        self.assertEqual((args.baseline_speed, args.steps), (4.0, [1, 8]))
+
+    def test_baseline_transcripts_load_from_an_earlier_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "report.json"
+            report.write_text(
+                '{"baseline": {"transcripts": {"a.wav": "hello"}}}', encoding="utf-8"
+            )
+            empty = Path(tmp) / "empty.json"
+            empty.write_text('{"baseline": null}', encoding="utf-8")
+
+            self.assertEqual(load_baseline(report), {"a.wav": "hello"})
+            with self.assertRaises(SystemExit):
+                load_baseline(empty)
 
 
 class EnergyVADAnalyzer(VADAnalyzer):

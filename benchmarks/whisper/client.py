@@ -16,7 +16,7 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -73,10 +73,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--ramp",
         help="comma-separated session counts run one after another, e.g. 1,2,4,8,16",
     )
-    parser.add_argument(
+    baseline = parser.add_mutually_exclusive_group()
+    baseline.add_argument(
         "--baseline",
         action="store_true",
         help="first transcribe each file alone, then measure transcript drift under load",
+    )
+    baseline.add_argument(
+        "--baseline-from",
+        type=Path,
+        help="reuse the baseline transcripts saved in an earlier report",
+    )
+    parser.add_argument(
+        "--baseline-speed",
+        type=float,
+        help="streaming speed for the solo baseline runs (default: --speed)",
+    )
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="run the --baseline and stop, without load steps",
     )
     parser.add_argument("--speed", type=float, default=1.0, help="1.0 streams in real time")
     parser.add_argument("--stagger", type=float, default=0.0, help="seconds between session starts")
@@ -127,7 +143,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("session counts must be at least 1")
     if args.speed <= 0:
         parser.error("--speed must be positive")
+    if args.baseline_speed is not None and args.baseline_speed <= 0:
+        parser.error("--baseline-speed must be positive")
+    if args.baseline_only and not args.baseline:
+        parser.error("--baseline-only requires --baseline")
+    if args.baseline_only and args.steps:
+        parser.error("--baseline-only cannot be combined with --sessions or --ramp")
     return args
+
+
+def load_baseline(path: Path) -> dict[str, str]:
+    """Baseline transcripts from an earlier report, keyed by file name."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    transcripts = (data.get("baseline") or {}).get("transcripts")
+    if not isinstance(transcripts, dict) or not transcripts:
+        raise SystemExit(f"{path} has no baseline transcripts")
+    return {str(k): str(v) for k, v in transcripts.items()}
 
 
 # --------------------------------------------------------------------------
@@ -420,7 +451,8 @@ class View:
                 f"infer p50={_fmt(summary['inference_p50'])}s "
                 f"peak GPU={_fmt(summary['peak_gpu_percent'], '%', 0)} "
                 f"{_fmt(summary['peak_gpu_memory_mb'], 'MB', 0)} "
-                f"drift max={_fmt(summary['drift_wer_max'])} -> {verdict}",
+                f"drift max={_fmt(summary['drift_wer_max'])} "
+                f"ref WER={_fmt(summary['reference_wer_mean'])} -> {verdict}",
                 flush=True,
             )
 
@@ -539,7 +571,8 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
             table = Table(
                 title=(
                     "summary - seconds unless noted; lat = VAD stop -> transcript, "
-                    "q = engine queue wait, inf = inference"
+                    "q = engine queue wait, inf = inference, drift = max WER vs solo "
+                    "baseline, refWER = mean WER vs .txt references"
                 ),
                 title_justify="left",
                 box=box.SIMPLE_HEAD,
@@ -547,7 +580,7 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
             table.add_column("step", no_wrap=True, min_width=8)
             for name in (
                 "sess", "segs", "err", "lat50", "lat95", "latmax", "q95",
-                "inf50", "queued", "gpu%", "gpuMB", "cpu%", "lag ms", "drift",
+                "inf50", "queued", "gpu%", "gpuMB", "cpu%", "lag ms", "drift", "refWER",
             ):
                 table.add_column(name, justify="right", no_wrap=True)
             for label, s in rows:
@@ -568,6 +601,7 @@ def make_view(poller: StatsPoller, plain: bool) -> View:
                     _fmt(s["peak_cpu_percent"], "", 0),
                     _fmt(s["peak_loop_lag_ms"], "", 0),
                     _fmt(s["drift_wer_max"]),
+                    _fmt(s["reference_wer_mean"]),
                 )
             self.console.print(table)
             for label, s in rows:
@@ -599,7 +633,13 @@ async def run(args: argparse.Namespace) -> int:
     if len(set(names)) != len(names):
         raise SystemExit("audio file names must be unique (they label sessions and baselines)")
     references = {clip.name: clip.reference for clip in clips if clip.reference}
-    steps = args.steps or [len(clips)]
+    steps = [] if args.baseline_only else (args.steps or [len(clips)])
+    baseline: dict[str, str] | None = None
+    if args.baseline_from:
+        baseline = load_baseline(args.baseline_from)
+        missing = [name for name in names if name not in baseline]
+        if missing:
+            print(f"warning: {len(missing)} file(s) have no baseline transcript, e.g. {missing[0]}")
 
     server = args.server.rstrip("/")
     opts = Options(
@@ -654,26 +694,66 @@ async def run(args: argparse.Namespace) -> int:
                 {"name": c.name, "duration_secs": c.duration_secs, "reference": c.reference}
                 for c in clips
             ],
-            "baseline": None,
+            "baseline": (
+                {"from": str(args.baseline_from), "transcripts": baseline} if baseline else None
+            ),
             "steps": [],
         }
+        report_path = _report_path(args, server_info)
         summaries: list[tuple[str, dict[str, Any]]] = []
-        baseline: dict[str, str] | None = None
         exit_code = 0
+
+        def save_report() -> None:
+            # Saved after every step, so a long run that dies keeps its data.
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+
         try:
             if args.baseline:
+                baseline_speed = args.baseline_speed or args.speed
+                baseline_opts = replace(opts, speed=baseline_speed)
                 baseline = {}
-                baseline_sessions = []
-                for clip in clips:
-                    (session,) = await run_step(http, opts, [clip], 1, poller, view, f"baseline {clip.name}")
+                baseline_sessions: list[SessionResult] = []
+                baseline_samples: list[dict[str, Any]] = []
+                client_cpu_peak = 0.0
+                for index, clip in enumerate(clips, start=1):
+                    (session,) = await run_step(
+                        http,
+                        baseline_opts,
+                        [clip],
+                        1,
+                        poller,
+                        view,
+                        f"baseline {index}/{len(clips)} {clip.name}",
+                    )
                     baseline_sessions.append(session)
+                    baseline_samples.extend(poller.samples)
+                    client_cpu_peak = max(client_cpu_peak, poller.client_cpu_peak)
                     if session.state == "done":
                         baseline[clip.name] = session.transcript
                 view.transcripts(baseline_sessions, None, references)
+                # Solo runs never queue, so only failures fail the baseline.
+                baseline_summary = summarize_step(
+                    baseline_sessions,
+                    baseline_samples,
+                    references=references,
+                    thresholds=replace(thresholds, max_p95_latency_secs=float("inf")),
+                    client_cpu_peak=client_cpu_peak,
+                )
+                label = f"baseline x{baseline_speed:g}"
+                summaries.append((label, baseline_summary))
+                view.summary([(label, baseline_summary)])
                 report["baseline"] = {
+                    "speed": baseline_speed,
+                    "summary": baseline_summary,
                     "transcripts": baseline,
                     "sessions": [s.to_dict() for s in baseline_sessions],
                 }
+                save_report()
+                if not baseline_summary["passed"]:
+                    exit_code = 1
 
             for count in steps:
                 label = f"step {count}"
@@ -695,6 +775,7 @@ async def run(args: argparse.Namespace) -> int:
                         "stats_samples": poller.samples,
                     }
                 )
+                save_report()
                 view.transcripts(sessions, baseline, references)
                 view.summary([(label, summary)])
                 if not summary["passed"]:
@@ -706,10 +787,8 @@ async def run(args: argparse.Namespace) -> int:
             poll_task.cancel()
             if len(summaries) > 1:
                 view.summary(summaries)
-            path = _report_path(args, server_info)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-            view.print(f"report: {path}")
+            save_report()
+            view.print(f"report: {report_path}")
         return exit_code
 
 

@@ -1,4 +1,10 @@
-from .engine import SharedWhisperEngine, WhisperEngine, WhisperEngineConfig
+from .engine import (
+    SharedWhisperEngine,
+    WhisperEngine,
+    WhisperEngineConfig,
+    WhisperEngineStats,
+    WhisperTranscription,
+)
 from .stt import SharedWhisperSTTService
 
 __all__ = [
@@ -6,4 +12,6 @@ __all__ = [
     "SharedWhisperSTTService",
     "WhisperEngine",
     "WhisperEngineConfig",
+    "WhisperEngineStats",
+    "WhisperTranscription",
 ]

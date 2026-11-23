@@ -4,7 +4,6 @@ from collections.abc import AsyncGenerator
 from typing import Any, cast
 
 import numpy as np
-from faster_whisper.transcribe import Segment
 from loguru import logger
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
 from pipecat.services.settings import STTSettings
@@ -13,7 +12,7 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.types import NOT_GIVEN, assert_given, is_given
 
-from .engine import WhisperEngine
+from .engine import WhisperEngine, WhisperTranscription
 
 
 class SharedWhisperSTTService(WhisperSTTService):
@@ -51,6 +50,7 @@ class SharedWhisperSTTService(WhisperSTTService):
         """
         # Set before the base initializer, which calls ``_load``.
         self._engine = engine
+        self._last_transcription: WhisperTranscription | None = None
 
         effective_settings = self.Settings(model=engine.model_name)
         if settings is not None:
@@ -66,6 +66,15 @@ class SharedWhisperSTTService(WhisperSTTService):
     @property
     def engine(self) -> WhisperEngine:
         return self._engine
+
+    @property
+    def last_transcription(self) -> WhisperTranscription | None:
+        """The engine result of the most recent segment, or ``None`` if it failed.
+
+        Segments are transcribed one at a time per service, so this always
+        belongs to the segment whose frames were pushed last.
+        """
+        return self._last_transcription
 
     def _load(self):
         """Use the shared engine instead of loading a model for this instance."""
@@ -116,11 +125,12 @@ class SharedWhisperSTTService(WhisperSTTService):
 
         audio_float = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
-        segments: list[Segment] | None = None
+        result: WhisperTranscription | None = None
         error: Exception | None = None
+        self._last_transcription = None
         await self.start_processing_metrics()
         try:
-            segments = await self._engine.transcribe(
+            result = await self._engine.transcribe(
                 audio_float,
                 language=language,
                 hotwords=hotwords,
@@ -131,12 +141,13 @@ class SharedWhisperSTTService(WhisperSTTService):
         finally:
             await self.stop_processing_metrics()
 
-        if error is not None:
+        if error is not None or result is None:
             yield ErrorFrame(error=f"Whisper transcription failed: {error}", exception=error)
             return
+        self._last_transcription = result
 
         text = ""
-        for segment in segments or []:
+        for segment in result.segments:
             if (
                 no_speech_prob_threshold is not None
                 and segment.no_speech_prob < no_speech_prob_threshold
@@ -151,4 +162,8 @@ class SharedWhisperSTTService(WhisperSTTService):
                 self._user_id,
                 time_now_iso8601(),
                 language,
+                result={
+                    "queue_wait_secs": result.queue_wait_secs,
+                    "inference_secs": result.inference_secs,
+                },
             )

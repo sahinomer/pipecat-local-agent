@@ -38,15 +38,17 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
         engine = _engine(model)
         self.addCleanup(engine.close)
 
-        segments = await engine.transcribe(
+        result = await engine.transcribe(
             marker_audio(123),
             language="tr",
             hotwords="pipecat",
             initial_prompt="previous turn",
         )
 
-        self.assertIsInstance(segments, list)
-        self.assertEqual([s.text for s in segments], ["tr:123"])
+        self.assertIsInstance(result.segments, list)
+        self.assertEqual([s.text for s in result.segments], ["tr:123"])
+        self.assertGreaterEqual(result.queue_wait_secs, 0)
+        self.assertGreaterEqual(result.inference_secs, 0)
         self.assertEqual(
             model.calls,
             [
@@ -80,7 +82,7 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
             *(engine.transcribe(marker_audio(m), language="en") for m in (1, 2, 3, 4))
         )
 
-        self.assertEqual([r[0].text for r in results], ["en:1", "en:2", "en:3", "en:4"])
+        self.assertEqual([r.segments[0].text for r in results], ["en:1", "en:2", "en:3", "en:4"])
         self.assertEqual(model.max_active, 1)
         self.assertEqual(model.decoded_markers, [1, 2, 3, 4])
 
@@ -100,7 +102,7 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
         gate.set()
         results = await asyncio.gather(*tasks)
 
-        self.assertEqual(sorted(r[0].text for r in results), ["en:1", "en:2", "en:3", "en:4"])
+        self.assertEqual(sorted(r.segments[0].text for r in results), ["en:1", "en:2", "en:3", "en:4"])
         self.assertEqual(model.max_active, 2)
         self.assertEqual((engine.queued, engine.running), (0, 0))
 
@@ -121,7 +123,7 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.queued, 0)
 
         gate.set()
-        self.assertEqual((await running)[0].text, "en:1")
+        self.assertEqual((await running).segments[0].text, "en:1")
         self.assertEqual([call["marker"] for call in model.calls], [1])
         self.assertEqual((engine.queued, engine.running), (0, 0))
 
@@ -140,7 +142,7 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
             await cancelled
         gate.set()
 
-        self.assertEqual((await kept)[0].text, "tr:2")
+        self.assertEqual((await kept).segments[0].text, "tr:2")
         # The cancelled request was already decoding, so it finishes in the
         # background and its result is discarded.
         await wait_until(lambda: engine.running == 0)
@@ -156,10 +158,10 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
             return_exceptions=True,
         )
 
-        self.assertEqual(results[0][0].text, "en:1")
+        self.assertEqual(results[0].segments[0].text, "en:1")
         self.assertIsInstance(results[1], RuntimeError)
         self.assertIn("marker 2", str(results[1]))
-        self.assertEqual(results[2][0].text, "en:3")
+        self.assertEqual(results[2].segments[0].text, "en:3")
         self.assertEqual((engine.queued, engine.running), (0, 0))
 
     async def test_close_fails_waiting_requests_and_rejects_new_ones(self):
@@ -175,7 +177,7 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.close()
         gate.set()
 
-        self.assertEqual((await running)[0].text, "en:1")
+        self.assertEqual((await running).segments[0].text, "en:1")
         # A waiting request fails like any transcription error, not with a
         # CancelledError that would stop the session's task.
         with self.assertRaisesRegex(RuntimeError, "closed"):
@@ -184,6 +186,37 @@ class SharedWhisperEngineTests(unittest.IsolatedAsyncioTestCase):
             await engine.transcribe(marker_audio(3), language="en")
         self.assertEqual([call["marker"] for call in model.calls], [1])
         self.assertTrue(engine.closed)
+
+    async def test_stats_count_completed_failed_and_cancelled_requests(self):
+        gate = threading.Event()
+        model = FakeWhisperModel(gate=gate, fail_markers=frozenset({2}))
+        engine = _engine(model, num_workers=1)
+        self.addCleanup(engine.close)
+
+        first = asyncio.create_task(engine.transcribe(marker_audio(1), language="en"))
+        await wait_until(lambda: engine.running == 1)
+        failing = asyncio.create_task(engine.transcribe(marker_audio(2), language="en"))
+        dropped = asyncio.create_task(engine.transcribe(marker_audio(3), language="en"))
+        await wait_until(lambda: engine.queued == 2)
+        self.assertEqual(engine.stats().queued, 2)
+
+        dropped.cancel()
+        gate.set()
+        await first
+        with self.assertRaises(RuntimeError):
+            await failing
+        with self.assertRaises(asyncio.CancelledError):
+            await dropped
+
+        stats = engine.stats()
+        self.assertEqual(
+            (stats.workers, stats.queued, stats.running),
+            (1, 0, 0),
+        )
+        self.assertEqual(
+            (stats.completed, stats.failed, stats.cancelled),
+            (1, 1, 1),
+        )
 
     async def test_load_shares_one_engine_per_config(self):
         # The process-wide registry outlives each test, so use unique names.

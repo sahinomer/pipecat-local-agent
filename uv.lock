@@ -1578,6 +1578,11 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
+[package.dev-dependencies]
+bench = [
+    { name = "rich" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.11.12,<4" },
@@ -1597,6 +1602,9 @@ requires-dist = [
     { name = "torch", specifier = ">=2.5.0,<3" },
     { name = "uvicorn", specifier = ">=0.32.0,<1" },
 ]
+
+[package.metadata.requires-dev]
+bench = [{ name = "rich", specifier = ">=15,<16" }]
 
 [[package]]
 name = "pipecat-resampler"

@@ -9,6 +9,7 @@ results.
 
 import asyncio
 import threading
+import time
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -19,6 +20,34 @@ from faster_whisper import WhisperModel
 from faster_whisper.transcribe import Segment
 from loguru import logger
 from pipecat.utils.models import load_shared_model
+
+
+@dataclass(frozen=True)
+class WhisperTranscription:
+    """One request's result and where its time went.
+
+    Parameters:
+        segments: The decoded segments, fully consumed.
+        queue_wait_secs: Time from submission until a worker picked it up.
+        inference_secs: Time the model spent on it, including feature
+            extraction and decoding.
+    """
+
+    segments: list[Segment]
+    queue_wait_secs: float
+    inference_secs: float
+
+
+@dataclass(frozen=True)
+class WhisperEngineStats:
+    """A point-in-time view of an engine's load and totals."""
+
+    workers: int
+    queued: int
+    running: int
+    completed: int
+    failed: int
+    cancelled: int
 
 
 class WhisperEngine(Protocol):
@@ -41,8 +70,12 @@ class WhisperEngine(Protocol):
         language: str | None,
         hotwords: str | None = None,
         initial_prompt: str | None = None,
-    ) -> list[Segment]:
+    ) -> WhisperTranscription:
         """Transcribe mono float32 audio at 16 kHz."""
+        ...
+
+    def stats(self) -> WhisperEngineStats:
+        """The engine's current load and totals."""
         ...
 
 
@@ -114,6 +147,9 @@ class SharedWhisperEngine:
         self._stats_lock = threading.Lock()
         self._queued = 0
         self._running = 0
+        self._completed = 0
+        self._failed = 0
+        self._cancelled = 0
         self._closed = False
 
     @classmethod
@@ -172,6 +208,17 @@ class SharedWhisperEngine:
     def closed(self) -> bool:
         return self._closed
 
+    def stats(self) -> WhisperEngineStats:
+        with self._stats_lock:
+            return WhisperEngineStats(
+                workers=self._num_workers,
+                queued=self._queued,
+                running=self._running,
+                completed=self._completed,
+                failed=self._failed,
+                cancelled=self._cancelled,
+            )
+
     async def transcribe(
         self,
         audio: np.ndarray,
@@ -179,7 +226,7 @@ class SharedWhisperEngine:
         language: str | None,
         hotwords: str | None = None,
         initial_prompt: str | None = None,
-    ) -> list[Segment]:
+    ) -> WhisperTranscription:
         """Transcribe mono float32 audio at 16 kHz on a worker thread.
 
         Raises:
@@ -197,6 +244,7 @@ class SharedWhisperEngine:
                 language,
                 hotwords,
                 initial_prompt,
+                time.perf_counter(),
             )
         except RuntimeError:
             # The executor was shut down between the closed check and submit.
@@ -227,6 +275,7 @@ class SharedWhisperEngine:
         if future.cancelled():
             with self._stats_lock:
                 self._queued -= 1
+                self._cancelled += 1
 
     def _transcribe_blocking(
         self,
@@ -234,10 +283,13 @@ class SharedWhisperEngine:
         language: str | None,
         hotwords: str | None,
         initial_prompt: str | None,
-    ) -> list[Segment]:
+        submitted_at: float,
+    ) -> WhisperTranscription:
+        started_at = time.perf_counter()
         with self._stats_lock:
             self._queued -= 1
             self._running += 1
+        succeeded = False
         try:
             if self._closed:
                 raise RuntimeError("Whisper engine is closed")
@@ -252,7 +304,17 @@ class SharedWhisperEngine:
             )
             # ``segments`` is lazy and decodes while it is consumed, so consume
             # it here on the worker thread, not on the event loop.
-            return list(segments)
+            result = WhisperTranscription(
+                segments=list(segments),
+                queue_wait_secs=started_at - submitted_at,
+                inference_secs=time.perf_counter() - started_at,
+            )
+            succeeded = True
+            return result
         finally:
             with self._stats_lock:
                 self._running -= 1
+                if succeeded:
+                    self._completed += 1
+                else:
+                    self._failed += 1

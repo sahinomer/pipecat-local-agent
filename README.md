@@ -274,6 +274,12 @@ Use the actual vLLM port when it differs from `8000`. Prometheus reloads this
 file automatically. Leave the file as `[]` for Ollama or when native vLLM
 metrics are not required.
 
+## Whisper load test
+
+`benchmarks/whisper` holds a speech-to-text-only server and a concurrent
+client. Use them to see how many simultaneous sessions Whisper handles and to
+compare the per-connection model the agent uses today with the shared engine
+in `services/whisper`. See the [load test guide](benchmarks/whisper/README.md).
 
 ## License
 
